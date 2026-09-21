@@ -172,13 +172,18 @@ describe("resolveTarget — multiprovider virtual providers", () => {
 
 describe("shortAccountLabel", () => {
   it("drops a redundant provider prefix from a multiprovider label", () => {
-    expect(shortAccountLabel("Command Code · deepseek/deepseek-v4.1-flash", "CommandCode")).toBe("deepseek-v4.1-flash");
-    expect(shortAccountLabel("CodeBuddy · deepseek-v4.1-flash", "CodeBuddy")).toBe("deepseek-v4.1-flash");
+    expect(shortAccountLabel("CodeBuddy · short-name", "CodeBuddy")).toBe("short-name");
+    expect(shortAccountLabel("commandcode · other-name", "CommandCode")).toBe("other-name");
   });
 
-  it("keeps labels that carry real information", () => {
+  it("truncates long labels so they cannot crowd the footer line", () => {
+    expect(shortAccountLabel("Command Code · deepseek/deepseek-v4.1-flash", "CommandCode")).toBe("deepseek-v4.1…");
+  });
+
+  it("keeps short labels that carry real information", () => {
     expect(shortAccountLabel("work", "CommandCode")).toBe("work");
-    expect(shortAccountLabel("account two", "CodeBuddy")).toBe("account two");
+    expect(shortAccountLabel("google", "CommandCode")).toBe("google");
+    expect(shortAccountLabel("hello@raenzo.com", "CommandCode")).toBe("hello@raenzo.…");
   });
 
   it("returns undefined when nothing would remain", () => {

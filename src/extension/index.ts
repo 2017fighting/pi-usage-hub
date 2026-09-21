@@ -37,7 +37,13 @@ import {
 import { evaluateWarnings } from "../core/warnings.js";
 
 const EXTENSION_ID = "pi-usage-hub";
-const STATUS_KEY = EXTENSION_ID;
+/**
+ * Pi renders every `setStatus` entry on one footer line, sorted by key with
+ * `localeCompare` (see footer.ts in the Pi source). `pi-token-speed` uses the
+ * key `tokenSpeed`, so a `zz-` prefix places usage after it. Keep this in sync
+ * if that plugin ever changes its key.
+ */
+const STATUS_KEY = "zz-usage";
 const USAGE_UPDATE_EVENT = `${EXTENSION_ID}:update`;
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 const CACHE_TTL_MS = 60 * 1000;

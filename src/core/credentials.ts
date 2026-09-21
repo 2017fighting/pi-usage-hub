@@ -21,6 +21,12 @@ import type { ProviderKey } from "../core/types.js";
 export const MULTIPROVIDER_SERVICE_EVENT = "pi-multiprovider:service";
 export const SESSION_PIN_ENTRY_TYPE = "pi-multiprovider:switch-account";
 export const VIRTUAL_ID_SEPARATOR = "::";
+/**
+ * Multiprovider's id for the provider's own credential (auth.json, environment,
+ * or provider ambient auth). It is not a stored account and carries no token in
+ * the account store, so its credential is resolved by Pi instead.
+ */
+export const UPSTREAM_ACCOUNT_ID = "pi:default";
 
 export interface MultiProviderActiveAccount {
   id: string;
@@ -44,6 +50,13 @@ export interface MultiProviderServiceAnnouncement {
    * part of the upstream announcement, so it is optional and guarded.
    */
   getPoolSnapshot?(providerId: string): Promise<AccountSnapshot | undefined>;
+  /**
+   * The pool account most recently leased — the credential that served the
+   * latest request. Added by our fork; preferred over `getActiveAccount` for
+   * reporting, because affinity can name an account that upstream requests
+   * bypass (the upstream credential carries no resolvable token).
+   */
+  getMostRecentlyUsedAccount?(providerId: string): Promise<MultiProviderActiveAccount | undefined>;
 }
 
 export interface AccountSnapshot {
@@ -148,39 +161,32 @@ export async function resolveCredential(options: ResolveOptions): Promise<Resolv
 
   // 1. multiprovider pooled account (non-virtual: provider id stays the real one).
   const pooledId = options.piProviderId ?? piProviderIds[0];
-  if (multiprovider?.resolveActiveAccountAuth && pooledId) {
-    try {
-      const auth = await multiprovider.resolveActiveAccountAuth(pooledId, multiproviderContext, signal);
-      if (auth?.accessToken) {
-        const account = await multiprovider.getActiveAccount?.(pooledId, multiproviderContext);
-        const cooldownMs = await cooldownFor(multiprovider, pooledId, account?.id);
-        return {
-          token: auth.accessToken,
-          accountId: account?.id,
-          accountLabel: account?.label ?? auth.label,
-          cooldownMs,
-          source: "multiprovider",
-        };
-      }
-    } catch {
-      // Fall through to the registry path.
-    }
+  if (multiprovider && pooledId) {
+    const fromPool = await resolveFromPool(multiprovider, pooledId, multiproviderContext, signal);
+    if (fromPool) return fromPool;
   }
 
   // 2. Pi's model registry.
+  //
+  // This is also the path taken for a pooled provider whose active account is
+  // the upstream credential (`pi:default`): that account has no stored token to
+  // resolve, and Pi's own registry already holds the ambient credential the
+  // request will use. The account label is still reported so the footer names
+  // the credential in use rather than showing nothing.
+  const upstream = await describeUpstreamAccount(multiprovider, pooledId, multiproviderContext);
   for (const providerId of piProviderIds) {
     try {
       const status = registry.getProviderAuthStatus?.(providerId);
       if (status && status.configured === false) continue;
       const token = await registry.getApiKeyForProvider?.(providerId);
       if (typeof token === "string" && token.trim() !== "") {
-        return { token, source: "model-registry" };
+        return { token, source: "model-registry", ...(upstream ?? {}) };
       }
       const auth = await registry.getProviderAuth?.(providerId);
       const fromHeaders = bearerFromHeaders(auth?.auth?.headers);
       const direct = auth?.auth?.apiKey;
       const resolved = typeof direct === "string" && direct.trim() !== "" ? direct : fromHeaders;
-      if (resolved) return { token: resolved, source: "model-registry" };
+      if (resolved) return { token: resolved, source: "model-registry", ...(upstream ?? {}) };
     } catch {
       // Try the next id / fallback.
     }
@@ -191,6 +197,72 @@ export async function resolveCredential(options: ResolveOptions): Promise<Resolv
   if (fileToken) return { token: fileToken, source: "auth-file" };
 
   return { source: "none" };
+}
+
+/**
+ * Resolve a credential from a multiprovider pool.
+ *
+ * Prefers the account most recently leased, since that is the credential the
+ * last request actually spent. Falls back to the affinity-pinned active account
+ * when the fork's `getMostRecentlyUsedAccount` is unavailable.
+ *
+ * Returns undefined for the upstream account: it has no stored token, so the
+ * caller must fall through to Pi's own credential resolution.
+ */
+async function resolveFromPool(
+  multiprovider: MultiProviderServiceAnnouncement,
+  poolId: string,
+  ctx: unknown,
+  signal: AbortSignal | undefined,
+): Promise<ResolvedCredential | undefined> {
+  // Identify the account first so the reported label matches the resolved token.
+  let account: MultiProviderActiveAccount | undefined;
+  try {
+    account = await multiprovider.getMostRecentlyUsedAccount?.(poolId);
+    if (!account) account = await multiprovider.getActiveAccount?.(poolId, ctx);
+  } catch {
+    account = undefined;
+  }
+
+  // The upstream credential is not resolvable here; its token comes from Pi.
+  if (account?.id === UPSTREAM_ACCOUNT_ID) return undefined;
+  if (!multiprovider.resolveActiveAccountAuth) return undefined;
+
+  try {
+    const auth = await multiprovider.resolveActiveAccountAuth(poolId, ctx, signal);
+    if (!auth?.accessToken) return undefined;
+    const cooldownMs = await cooldownFor(multiprovider, poolId, account?.id);
+    return {
+      token: auth.accessToken,
+      accountId: account?.id,
+      accountLabel: account?.label ?? auth.label,
+      cooldownMs,
+      source: "multiprovider",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The pool's upstream account when it is the active one, so a caller can name
+ * the credential in use even though its token is resolved by Pi.
+ */
+async function describeUpstreamAccount(
+  multiprovider: MultiProviderServiceAnnouncement | undefined,
+  poolId: string | undefined,
+  ctx: unknown,
+): Promise<{ accountId?: string; accountLabel?: string } | undefined> {
+  if (!multiprovider || !poolId) return undefined;
+  try {
+    const account =
+      (await multiprovider.getMostRecentlyUsedAccount?.(poolId)) ??
+      (await multiprovider.getActiveAccount?.(poolId, ctx));
+    if (account?.id !== UPSTREAM_ACCOUNT_ID) return undefined;
+    return { accountId: account.id, accountLabel: account.label };
+  } catch {
+    return undefined;
+  }
 }
 
 function cooldownFor(

@@ -198,16 +198,20 @@ export function shortAccountLabel(
   accountLabel: string | undefined,
   providerLabel: string,
 ): string | undefined {
+  const tag = rawAccountTag(accountLabel, providerLabel);
+  if (tag === undefined) return undefined;
+  // Long labels (email addresses, model ids) crowd the footer line out.
+  return tag.length > 14 ? `${tag.slice(0, 13)}…` : tag;
+}
+
+function rawAccountTag(accountLabel: string | undefined, providerLabel: string): string | undefined {
   if (!accountLabel) return undefined;
   const trimmed = accountLabel.trim();
   if (trimmed === "") return undefined;
   const parts = trimmed.split(/\s*[·|]\s*/).filter((part) => part !== "");
-  const expected = providerLabel.toLowerCase();
   if (parts.length === 0) return undefined;
-  const head = parts[0]!.toLowerCase();
-  // "Command Code" vs "CommandCode": compare with separators removed too.
-  const normalize = (value: string) => value.replace(/[\s_-]/g, "");
-  if (normalize(head) === normalize(expected)) {
+  const normalize = (value: string) => value.replace(/[\s_-]/g, "").toLowerCase();
+  if (normalize(parts[0]!) === normalize(providerLabel)) {
     const rest = parts.slice(1).join(" · ");
     if (rest === "") return undefined;
     return rest.replace(/^deepseek\//, "");
