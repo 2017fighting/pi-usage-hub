@@ -25,11 +25,11 @@ import { PROVIDER_LABELS, PROVIDER_ORDER } from "../core/types.js";
 import { availabilityOf, sortUsages, soonestUsableReset } from "../core/format.js";
 import { formatWindow, formatFooterSummary, shortReset, colorForPercent, renderBar } from "../core/render.js";
 import { resolveEndpoints } from "../core/endpoints.js";
-import { PROVIDERS, detectProviderKey, providerByKey } from "../providers/registry.js";
+import { PROVIDERS, providerByKey } from "../providers/registry.js";
+import { resolveTarget, shortAccountLabel, type ActiveTarget } from "../core/target.js";
 import {
   MULTIPROVIDER_SERVICE_EVENT,
   resolveCredential,
-  resolveVirtualBackend,
   type MultiProviderServiceAnnouncement,
   type ModelRegistryLike,
   type SessionManagerLike,
@@ -42,19 +42,16 @@ const USAGE_UPDATE_EVENT = `${EXTENSION_ID}:update`;
 const POLL_INTERVAL_MS = 2 * 60 * 1000;
 const CACHE_TTL_MS = 60 * 1000;
 
-interface ActiveTarget {
-  provider: ProviderKey;
-  piProviderId: string;
-  accountLabel?: string;
-  /** Virtual provider display prefix, e.g. "dsv4 → ". */
-  virtualPrefix?: string;
-}
-
 interface UsageState {
   active?: ActiveTarget;
   usages: Map<ProviderKey, ProviderUsage>;
   available: Map<ProviderKey, boolean>;
 }
+
+/** Why the footer has nothing to show, surfaced so the reason is discoverable. */
+let lastNoneReason: string | undefined = undefined;
+/** A virtual provider whose backends are known but none is selected yet. */
+let pendingVirtual: { virtualProviderId: string; backendLabels: string[] } | undefined;
 
 export default function usageHub(pi: ExtensionAPI): void {
   const state: UsageState = { usages: new Map(), available: new Map() };
@@ -90,66 +87,30 @@ export default function usageHub(pi: ExtensionAPI): void {
   /**
    * Determine which provider is really serving this session.
    *
-   * Order of resolution for a virtual provider:
-   *  1. Ask multiprovider directly (our fork routes virtual pools through the
-   *     announcement, giving the real backend for both pinned and affinity
-   *     selections).
-   *  2. Fall back to the `/switch-account` session pin, which works with an
-   *     unpatched upstream multiprovider.
+   * Delegates to `resolveTarget` in core/target.ts, which owns the virtual
+   * provider logic and is unit tested against the real shapes.
    */
-  async function resolveTarget(ctx: ExtensionContext): Promise<ActiveTarget | undefined> {
-    const model = ctx.model;
-    if (!model) return undefined;
-    const rawProviderId = model.provider;
-    if (!rawProviderId) return undefined;
-
-    const registry = registryOf(ctx);
-    const registeredIds = registry.getRegisteredProviderIds?.();
-    // A provider id we natively support is always a real provider. Only an id we
-    // do not recognise can be a multiprovider virtual, and this must be decided
-    // from our own registry first: in `--no-extensions` runs Pi reports no
-    // registered ids at all, which would otherwise mark every provider virtual.
-    const knownKey = detectProviderKey(rawProviderId);
-    const isVirtual = knownKey === undefined && (registeredIds ? !registeredIds.includes(rawProviderId) : true);
-
-    if (isVirtual) {
-      const backend = await resolveVirtualTarget(ctx, rawProviderId, model.id);
-      if (!backend) return undefined;
-      const key = detectProviderKey(backend.providerId);
-      if (!key) return undefined;
-      return {
-        provider: key,
-        piProviderId: backend.providerId,
-        accountLabel: backend.accountLabel,
-        virtualPrefix: `${rawProviderId} → `,
-      };
+  async function resolveActiveTarget(ctx: ExtensionContext): Promise<ActiveTarget | undefined> {
+    const resolution = await resolveTarget({
+      model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined,
+      multiprovider,
+      multiproviderContext: ctx,
+      sessionManager: sessionsOf(ctx),
+    });
+    if (resolution.kind === "provider") {
+      const { kind: _kind, ...target } = resolution;
+      lastNoneReason = undefined;
+      return target;
     }
-
-    if (!knownKey) return undefined;
-    return { provider: knownKey, piProviderId: rawProviderId };
-  }
-
-  /** Resolve a virtual provider's serving backend, preferring the live service. */
-  async function resolveVirtualTarget(
-    ctx: ExtensionContext,
-    virtualProviderId: string,
-    modelId: string,
-  ): Promise<{ providerId: string; accountLabel?: string } | undefined> {
-    if (multiprovider?.getActiveAccount) {
-      try {
-        const account = await multiprovider.getActiveAccount(virtualProviderId, ctx);
-        // Virtual backend account ids are `${backendProviderId}::${backendModelId}`.
-        const backendProviderId = account?.id?.split("::")[0];
-        if (backendProviderId) {
-          return { providerId: backendProviderId, accountLabel: account?.label };
-        }
-      } catch {
-        // Fall through to the session-pin path.
-      }
+    if (resolution.kind === "pending") {
+      // Backends known, none selected yet (before the session's first request).
+      pendingVirtual = resolution;
+      lastNoneReason = undefined;
+      return undefined;
     }
-    const pinned = resolveVirtualBackend(sessionsOf(ctx), virtualProviderId, modelId);
-    if (!pinned) return undefined;
-    return { providerId: pinned.providerId };
+    pendingVirtual = undefined;
+    lastNoneReason = resolution.reason;
+    return undefined;
   }
 
   async function fetchForTarget(target: ActiveTarget, signal?: AbortSignal): Promise<ProviderUsage | undefined> {
@@ -199,12 +160,32 @@ export default function usageHub(pi: ExtensionAPI): void {
     if (!ctx || ctx.mode !== "tui") return;
     const target = state.active;
     if (!target) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      const theme = ctx.ui.theme;
+      // A virtual provider with known backends but no selection yet: show the
+      // pool so the footer is informative before the first request lands.
+      if (pendingVirtual) {
+        const labels = pendingVirtual.backendLabels.join(" | ");
+        ctx.ui.setStatus(
+          STATUS_KEY,
+          theme.fg("dim", `${pendingVirtual.virtualProviderId} → rotating: `) + theme.fg("muted", labels),
+        );
+        return;
+      }
+      // Explain the absence instead of silently rendering nothing: a virtual
+      // provider whose backend cannot be resolved used to leave the footer empty
+      // with no clue why.
+      const reason = lastNoneReason;
+      const model = ctx.model?.provider;
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        reason && model ? theme.fg("dim", `${model}: ${reason}`) : undefined,
+      );
       return;
     }
     const theme = ctx.ui.theme;
     const label = (target.virtualPrefix ?? "") + PROVIDER_LABELS[target.provider];
-    const accountSuffix = target.accountLabel ? theme.fg("dim", `#${target.accountLabel}`) : "";
+    const account = shortAccountLabel(target.accountLabel, PROVIDER_LABELS[target.provider]);
+    const accountSuffix = account ? theme.fg("dim", `#${account}`) : "";
     const usage = state.usages.get(target.provider);
 
     if (!usage) {
@@ -246,7 +227,7 @@ export default function usageHub(pi: ExtensionAPI): void {
         pollQueued = false;
         const ctx = currentContext;
         if (!ctx || ctx.mode !== "tui") return;
-        const target = await resolveTarget(ctx);
+        const target = await resolveActiveTarget(ctx);
         state.active = target;
         if (!target) {
           updateStatus();
@@ -346,9 +327,19 @@ export default function usageHub(pi: ExtensionAPI): void {
     pollTimer = undefined;
 
     if (pi.getFlag("usage") === true) {
-      const target = await resolveTarget(ctx);
+      const target = await resolveActiveTarget(ctx);
       if (!target) {
-        console.log(JSON.stringify({ extension: EXTENSION_ID, status: "unsupported", provider: ctx.model?.provider }));
+        console.log(
+          JSON.stringify({
+            extension: EXTENSION_ID,
+            status: pendingVirtual ? "pending" : "unsupported",
+            provider: ctx.model?.provider,
+            ...(pendingVirtual
+              ? { virtualProviderId: pendingVirtual.virtualProviderId, backends: pendingVirtual.backendLabels }
+              : {}),
+            reason: lastNoneReason,
+          }),
+        );
       } else {
         const usage = await fetchForTarget(target, sessionController.signal);
         console.log(
@@ -367,7 +358,7 @@ export default function usageHub(pi: ExtensionAPI): void {
     }
 
     if (ctx.mode !== "tui") return;
-    state.active = await resolveTarget(ctx);
+    state.active = await resolveActiveTarget(ctx);
     updateStatus();
     void poll();
     pollTimer = setInterval(() => void poll(), POLL_INTERVAL_MS);
@@ -387,7 +378,7 @@ export default function usageHub(pi: ExtensionAPI): void {
 
   pi.on("model_select", async (_event, ctx) => {
     currentContext = ctx;
-    state.active = await resolveTarget(ctx);
+    state.active = await resolveActiveTarget(ctx);
     updateStatus();
     void poll();
   });
@@ -406,7 +397,7 @@ export default function usageHub(pi: ExtensionAPI): void {
         ctx.ui.notify(renderPlainSummary(usages), "info");
         return;
       }
-      const active = await resolveTarget(ctx);
+      const active = await resolveActiveTarget(ctx);
       await ctx.ui.custom<void>((tui, theme, keybindings, done) =>
         new UsageDashboardComponent(tui, theme, keybindings, active?.provider, (signal) => fetchAll(ctx, signal), () => done()),
       );
@@ -576,7 +567,8 @@ class UsageDashboardComponent extends Container implements Focusable {
           : theme.fg("dim", "○");
     const pointer = selected ? theme.fg("accent", "→ ") : "  ";
     const activeBadge = this.activeProvider === usage.provider ? theme.fg("success", " ✓") : "";
-    const account = usage.accountLabel ? theme.fg("dim", `#${usage.accountLabel}`) : "";
+    const accountTag = shortAccountLabel(usage.accountLabel, PROVIDER_LABELS[usage.provider]);
+    const account = accountTag ? theme.fg("dim", `#${accountTag}`) : "";
     const name = selected ? theme.fg("accent", theme.bold(PROVIDER_LABELS[usage.provider])) : PROVIDER_LABELS[usage.provider];
     this.listContainer.addChild(new Text(`${pointer}${badge} ${name}${account}${activeBadge}`, 0, 0));
 
