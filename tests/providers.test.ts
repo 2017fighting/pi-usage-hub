@@ -91,8 +91,9 @@ describe("deepseek parser", () => {
     const { windows, isAvailable } = parseDeepSeekBalance(payload);
     expect(isAvailable).toBe(true);
     expect(windows[0]).toMatchObject({ kind: "balance", isCurrency: true, currency: "CNY", balanceValue: 12.34, limited: false });
-    expect(windows[0]!.note).toContain("12.34");
+    // The note carries only the breakdown; the amount renders from balanceValue.
     expect(windows[0]!.note).toContain("topped-up");
+    expect(windows[0]!.usedPercent).toBeUndefined();
   });
 
   it("flags a negative balance as limited (live account state)", () => {
@@ -172,12 +173,18 @@ describe("codebuddy parser", () => {
     expect(packages[0]!.resetsAt).toBe(new Date("2026-10-16T01:25:31+08:00").getTime());
   });
 
-  it("sums a total window and marks exhaustion", () => {
+  it("does not fabricate a percentage for balance packages", () => {
     const windows = codeBuddyWindows(parseCodeBuddySummary(summary));
     const total = windows[0]!;
-    expect(total.label).toBe("Total credits");
+    expect(total.kind).toBe("balance");
+    // A currency/credit balance is not a fraction of a plan, so no bar data.
+    expect(total.usedPercent).toBeUndefined();
     expect(total.balanceValue).toBeCloseTo(1387.02, 1);
-    expect(total.limited).toBe(false);
+    expect(total.limitValue).toBe(2000);
+    // The total is the single authority on availability; packages are
+    // informational so an exhausted package cannot mark the provider exhausted.
+    expect(total.gating).not.toBe(false);
+    expect(windows.slice(1).every((window) => window.gating === false)).toBe(true);
   });
 
   it("marks total as limited when everything is spent", () => {

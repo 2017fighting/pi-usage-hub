@@ -70,10 +70,15 @@ export function parseCommandCodeCredits(payload: unknown, nowMs = Date.now()): Q
     const purchased = toNumber(credits.purchasedCredits) ?? 0;
     const free = toNumber(credits.freeCredits) ?? 0;
     const remaining = monthly + purchased + free;
+    // Only surface buckets that actually contribute, so a plan with just
+    // monthly credits does not render as a wall of zeroes.
+    const breakdown = [
+      purchased > 0 ? `purchased ${purchased.toFixed(2)}` : undefined,
+      free > 0 ? `free ${free.toFixed(2)}` : undefined,
+    ].filter((value): value is string => value !== undefined);
     windows.push({
       label: "Monthly credits",
-      // Percent used is relative to the credits that remain plus what has been
-      // consumed; the consumed part is filled in by the caller via usage summary.
+      // Percent used is derived from the usage summary by the caller.
       usedPercent: undefined,
       resetsAt: parseResetTime(credits.monthlyResetAt),
       windowSeconds: 30 * 86_400,
@@ -83,7 +88,7 @@ export function parseCommandCodeCredits(payload: unknown, nowMs = Date.now()): Q
       limited: remaining <= 0,
       isBalance: true,
       kind: "balance",
-      note: `monthly ${monthly.toFixed(2)} · purchased ${purchased.toFixed(2)} · free ${free.toFixed(2)}`,
+      note: breakdown.length > 0 ? breakdown.join(" · ") : undefined,
     });
   }
 

@@ -40,14 +40,15 @@ export function parseDeepSeekBalance(payload: unknown): { windows: QuotaWindow[]
 
     windows.push({
       label: "Balance",
-      // The amount is what matters for a balance; the note carries the breakdown.
       balanceValue: total,
       resetsAt: undefined,
       isCurrency: true,
       currency,
       limited: total <= 0,
       isBalance: true,
-      note: details.length > 0 ? `${formatAmount(total, currency)} · ${details.join(" · ")}` : undefined,
+      // The amount is rendered from balanceValue; the note carries only the
+      // breakdown so it is not repeated.
+      note: details.length > 0 ? details.join(" · ") : undefined,
       kind: "balance",
     });
   }

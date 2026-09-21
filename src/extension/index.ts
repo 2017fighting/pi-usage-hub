@@ -23,7 +23,7 @@ import { Container, Input, Spacer, Text, type Focusable, type TUI } from "@earen
 import type { ProviderKey, ProviderUsage } from "../core/types.js";
 import { PROVIDER_LABELS, PROVIDER_ORDER } from "../core/types.js";
 import { availabilityOf, sortUsages, soonestUsableReset } from "../core/format.js";
-import { formatWindow, shortReset, worstPercent, colorForPercent, renderBar } from "../core/render.js";
+import { formatWindow, formatFooterSummary, shortReset, colorForPercent, renderBar } from "../core/render.js";
 import { resolveEndpoints } from "../core/endpoints.js";
 import { PROVIDERS, detectProviderKey, providerByKey } from "../providers/registry.js";
 import {
@@ -220,29 +220,19 @@ export default function usageHub(pi: ExtensionAPI): void {
       return;
     }
 
-    const worst = worstPercent(usage.windows);
-    const color = worst === undefined ? "muted" : colorForPercent(worst);
-    // Headline: the most-consumed window, compactly.
-    const headline = pickHeadline(usage);
-    const parts: string[] = [theme.fg("dim", `${label}${accountSuffix}`)];
-    if (headline) {
-      const percent = headline.usedPercent ?? 0;
-      parts.push(renderBar((t) => theme.fg(colorForPercent(percent), t), (t) => theme.fg("dim", t), percent, 6));
-      parts.push(theme.fg(colorForPercent(percent), `${Math.round(percent)}%`));
-      const reset = shortReset(headline.resetsAt);
-      if (reset) parts.push(theme.fg("dim", `⟳${reset}`));
-    } else {
-      parts.push(theme.fg(color, formatWindow(theme, usage.windows[0]!, { barWidth: 0, showReset: false })));
+    // Summary is a bar for quota providers, or a plain amount for balance-only
+    // providers (a currency balance is not a fraction of a plan).
+    const summary = formatFooterSummary(theme, usage.windows);
+    if (!summary) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
     }
+    const parts: string[] = [theme.fg("dim", `${label}${accountSuffix}`), summary];
     if (usage.cooldownMs && usage.cooldownMs > 0) {
       parts.push(theme.fg("error", `cooldown ${shortReset(Date.now() + usage.cooldownMs)}`));
     }
     if (usage.stale) parts.push(theme.fg("warning", "stale"));
     ctx.ui.setStatus(STATUS_KEY, parts.join(" "));
-  }
-
-  function pickHeadline(usage: ProviderUsage) {
-    return pickHeadlineWindow(usage);
   }
 
   async function poll(): Promise<void> {
@@ -714,14 +704,13 @@ class UsageDashboardComponent extends Container implements Focusable {
 }
 
 /**
- * The window that best summarises a provider in one line: the most-consumed
- * gating window. Informational windows (ZAI's monthly web quota) are excluded so
- * they can never headline the footer, and balance rows are used only when the
- * provider has nothing else.
+ * The window that best collapses a provider into a single dashboard line: the
+ * most-consumed gating quota window. Informational windows (ZAI's monthly web
+ * quota) are excluded, and balance rows are used only when nothing else exists.
  */
 function pickHeadlineWindow(usage: ProviderUsage) {
   const gating = usage.windows.filter((window) => window.gating !== false);
-  const quotaWindows = gating.filter((window) => window.kind === "quota");
+  const quotaWindows = gating.filter((window) => window.kind === "quota" && window.usedPercent !== undefined);
   const pool = quotaWindows.length > 0 ? quotaWindows : gating.length > 0 ? gating : usage.windows;
   return [...pool].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0];
 }

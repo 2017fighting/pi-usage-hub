@@ -136,14 +136,30 @@ pi.events.on("pi-usage-hub:update", ({ provider, account, usage }) => {
 
 ## Notes on provider semantics
 
+### Bars are for plans, amounts are for balances
+
+Progress bars only appear where a percentage is real — a window with a defined cap. Providers that sell **prepaid balances** (DeepSeek, CodeBuddy credits, Command Code monthly credits) have no plan to be a fraction of, so they render as amounts:
+
+```
+DeepSeek  -CN¥0.20
+CodeBuddy 1387.02 / 2000.00 credits
+```
+
+An earlier version drew an empty bar and `0%` for these, which was doubly wrong: the `0%` was invented, and it read as "nothing used" on an overdrawn account. Balance rows now carry no bar and no percentage, ever.
+
+- **CodeBuddy** sells credit packages. The combined total is what gates availability; each package is informational, with its own cycle end time. Authentication uses the CodeBuddy OAuth JWT Pi already stores — no browser cookie is needed.
+- **DeepSeek** is a prepaid balance with no reset. It reports as `exhausted` when the balance reaches zero (a negative balance is valid and shown as such).
+- **Antigravity** prefers the grouped `retrieveUserQuotaSummary` (Gemini and Claude/GPT pools, each with 5h + weekly buckets). When that is gated, it falls back to per-model `quotaInfo`, which is **pool-shared**, not a private per-model budget.
+- Fetch failures are reported as `unknown`, never as zero.
+
 ### Availability is a group AND, not a window OR
 
 A provider is **available** only when some group of windows is entirely unblocked. Windows that apply to the same request are ANDed; independent pools are ORed:
 
 - **ZAI** — the 5h window *and* the weekly cap both apply. A live account at 5h = 4% and weekly = 100% is **exhausted**, because the API answers `1310 weekly/monthly limit reached`. Reporting it available because the 5h window had room was a bug. Its monthly **web-search** quota is informational and never blocks coding requests.
 - **Antigravity** — Gemini and Claude/GPT are independent pools (OR); within a pool the 5h and weekly buckets both apply (AND).
-- **CodeBuddy** — credit packages are alternatives (OR): spending comes from whichever package still has credits.
-- **Kimi** — the 5h window and the monthly pool both gate (AND). The monthly pool having room while 5h is exhausted does *not* make it usable... unless the monthly pool is what's exhausted; both must have room.
+- **CodeBuddy** — the combined total gates usage; individual packages are informational alternatives (OR).
+- **Kimi** — the 5h window and the monthly pool both gate (AND), so the provider needs room in both.
 
 The **reset shown for an exhausted provider is the one that actually unblocks it** — a provider waiting on a weekly cap reports the weekly reset, never an earlier 5h reset that would leave it still blocked. Exhausted prepaid balances with no reset time sort last, under `no reset`.
 

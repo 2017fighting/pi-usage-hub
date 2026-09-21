@@ -92,22 +92,25 @@ export function codeBuddyWindows(packages: CodeBuddyPackage[]): QuotaWindow[] {
 
   if (packages.length === 0) return windows;
 
-  // Combined total is the headline window: it answers "can I still use CodeBuddy?".
+  // The combined total is the window that answers "can I still use CodeBuddy?",
+  // and the gating one for availability. It mixes two different quantities
+  // (spent credits across packages, remaining credits left), which is not a
+  // meaningful percentage of a plan, so it is a balance row without a bar.
   windows.push({
     label: "Total credits",
-    usedPercent: totalCapacity > 0 ? clampPercent((1 - totalRemaining / totalCapacity) * 100) : undefined,
     resetsAt: soonestPackageReset(packages),
     balanceValue: totalRemaining,
     limitValue: totalCapacity,
     limited: totalRemaining <= 0,
     isBalance: true,
     kind: "balance",
-    note: `${totalRemaining.toFixed(2)} / ${totalCapacity.toFixed(2)} credits`,
   });
 
-  // Credit packages are alternatives: spending comes out of whichever package
-  // still has credits, so an exhausted package must not make the provider look
-  // exhausted while another package has room. Each gets its own group.
+  // Individual packages are alternatives: spending comes out of whichever
+  // package still has credits, so an exhausted package must not make the
+  // provider look exhausted while another package has room. Each package is its
+  // own non-gating group so the total stays the single authority on
+  // availability, while per-package cycle resets remain visible.
   for (const entry of packages) {
     windows.push({
       label: entry.name ?? entry.packageCode,
@@ -117,9 +120,9 @@ export function codeBuddyWindows(packages: CodeBuddyPackage[]): QuotaWindow[] {
       limitValue: entry.total,
       limited: entry.remaining <= 0,
       isBalance: true,
+      gating: false,
       group: `package:${entry.packageCode}`,
       kind: "balance",
-      note: `${entry.remaining.toFixed(2)} / ${entry.total.toFixed(2)} ${entry.unit}`,
     });
   }
 

@@ -22,7 +22,7 @@ export function renderBar(fill: (text: string) => string, dim: (text: string) =>
 }
 
 export interface WindowRenderOptions {
-  /** Bar width; 0 omits the bar (used for compact footer lanes). */
+  /** Bar width; 0 omits the bar. */
   barWidth?: number;
   /** Include the reset countdown. */
   showReset?: boolean;
@@ -30,8 +30,11 @@ export interface WindowRenderOptions {
 }
 
 /**
- * Render a single window as: `Label ████░░░░ 42% ⟳ 14:00 (1h23m)`.
- * Balance windows render as `Label 12.34 USD` instead.
+ * Render a single window as `Label ████░░░░ 42% ⟳ 14:00 (1h23m)`.
+ *
+ * Balance windows have no meaningful percentage — a currency amount is not a
+ * fraction of a plan — so they render as `Label ¥12.34 ›` and never grow a bar.
+ * Inventing a percentage for them would display a made-up fraction.
  */
 export function formatWindow(
   theme: Theme,
@@ -43,20 +46,27 @@ export function formatWindow(
 
   if (window.kind === "balance" || window.isBalance) {
     const amount = formatWindowAmount(window);
-    const percent = window.usedPercent;
-    if (percent !== undefined && barWidth > 0) {
+    const color: ThemeColor = window.limited ? "error" : "muted";
+    // Only show a bar when the provider genuinely expresses the balance as a
+    // fraction of a known pool (e.g. a key spending limit).
+    if (window.usedPercent !== undefined && barWidth > 0 && !window.isBalance) {
+      const percent = clampPercent(window.usedPercent) ?? 0;
       const bar = renderBar(
         (text) => theme.fg(colorForPercent(percent), text),
         (text) => theme.fg("dim", text),
         percent,
         barWidth,
       );
-      return `${label} ${bar} ${theme.fg(colorForPercent(percent), `${clampPercent(percent)}%`)} ${theme.fg("dim", amount)}`;
+      return `${label} ${bar} ${theme.fg(colorForPercent(percent), `${percent}%`)} ${theme.fg(color, amount)}`;
     }
-    return `${label} ${theme.fg("dim", amount)}`;
+    return `${label} ${theme.fg(color, amount)}`;
   }
 
-  const percent = clampPercent(window.usedPercent) ?? 0;
+  const percent = clampPercent(window.usedPercent);
+  if (percent === undefined) {
+    // A quota window without a percentage cannot be drawn as progress either.
+    return `${label} ${theme.fg("dim", window.note ?? "—")}`;
+  }
   const bar =
     barWidth > 0
       ? ` ${renderBar(
@@ -79,20 +89,81 @@ export function formatWindow(
 
 /** Format a balance window's amount, with currency when known. */
 export function formatWindowAmount(window: QuotaWindow): string {
-  if (window.note) return window.note;
-  const amount = window.balanceValue;
-  if (amount === undefined) return "";
-  if (window.isCurrency) {
-    try {
-      return new Intl.NumberFormat("en-US", {
-        style: "currency",
-        currency: window.currency && window.currency.length === 3 ? window.currency : "USD",
-      }).format(amount);
-    } catch {
-      return `${amount.toFixed(2)} ${window.currency ?? ""}`.trim();
-    }
+  const amount = formatAmountOnly(window);
+  // The note carries the breakdown, e.g. "topped-up $10.00 · granted $5.00".
+  // Skip it only when it already leads with the same amount, so a note that
+  // merely mentions the amount elsewhere is still shown alongside it.
+  if (!window.note || window.note.startsWith(amount)) return window.note ?? amount;
+  return `${amount} · ${window.note}`;
+}
+
+/**
+ * A one-line summary of a provider for the footer: a bar for quota windows, or
+ * a plain amount for balance-only providers.
+ *
+ * Returns undefined when the provider has nothing displayable.
+ */
+export function formatFooterSummary(
+  theme: Theme,
+  windows: QuotaWindow[],
+  options: { barWidth?: number; nowMs?: number } = {},
+): string | undefined {
+  const { barWidth = 6, nowMs = Date.now() } = options;
+  const gating = windows.filter((window) => window.gating !== false);
+  if (gating.length === 0) return undefined;
+
+  const quotaWindows = gating.filter((window) => window.kind === "quota" && window.usedPercent !== undefined);
+
+  // Quota providers: headline the most-consumed window, with its reset.
+  if (quotaWindows.length > 0) {
+    const headline = [...quotaWindows].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0]!;
+    const percent = clampPercent(headline.usedPercent) ?? 0;
+    const bar = renderBar(
+      (text) => theme.fg(colorForPercent(percent), text),
+      (text) => theme.fg("dim", text),
+      percent,
+      barWidth,
+    );
+    const reset = shortReset(headline.resetsAt, nowMs);
+    return `${bar} ${theme.fg(colorForPercent(percent), `${percent}%`)}${reset ? theme.fg("dim", ` ⟳${reset}`) : ""}`;
   }
-  return `${amount.toFixed(2)} credits`;
+
+  // Balance-only providers: show the amount, never a fabricated percentage.
+  const balances = gating.filter((window) => window.kind === "balance");
+  if (balances.length === 0) return undefined;
+  const total = balances.find((window) => window.balanceValue !== undefined);
+  if (!total) return undefined;
+  const color: ThemeColor = total.limited ? "error" : "muted";
+  const amount = total.balanceValue !== undefined
+    ? formatAmountOnly(total)
+    : total.note ?? "—";
+  return theme.fg(color, amount);
+}
+
+/** The bare amount of a balance window, without the appended breakdown note. */
+export function formatAmountOnly(window: QuotaWindow): string {
+  const amount = window.balanceValue;
+  if (amount === undefined) return window.note ?? "—";
+  const suffix = window.isCurrency ? "" : " credits";
+  const format = (value: number) => {
+    if (window.isCurrency) {
+      try {
+        return new Intl.NumberFormat("en-US", {
+          style: "currency",
+          currency: window.currency && window.currency.length === 3 ? window.currency : "USD",
+        }).format(value);
+      } catch {
+        return `${value.toFixed(2)} ${window.currency ?? ""}`.trim();
+      }
+    }
+    return value.toFixed(2);
+  };
+  // When the provider expresses a remaining amount against a known capacity,
+  // show the pair; it is the most useful thing a balance row can say.
+  if (window.limitValue !== undefined && window.limitValue > 0) {
+    return `${format(amount)} / ${format(window.limitValue)}${suffix}`;
+  }
+  return `${format(amount)}${suffix}`;
 }
 
 /** Worst (highest) used percentage across a provider's windows, for colouring a summary. */
