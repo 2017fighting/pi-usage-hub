@@ -85,14 +85,27 @@ export function collectWarnings(usage: ProviderUsage, nowMs = Date.now()): Quota
 
 const SEVERITY_RANK: Record<WarningSeverity, number> = { warning: 0, high: 1, critical: 2 };
 
-/** Notify on warnings worth surfacing, de-duplicating repeated ones. */
+/**
+ * Notify on warnings worth surfacing, de-duplicating repeated ones.
+ *
+ * Callers fire this without awaiting it, so it must never reject. In
+ * particular a context can already be stale when this runs — pi invalidates
+ * every captured ctx on session replacement — and reading `ctx.mode` then
+ * throws. Warnings are advisory, so a dead context simply means no warning.
+ */
 export async function evaluateWarnings(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   usage: ProviderUsage,
   nowMs = Date.now(),
 ): Promise<void> {
-  if (ctx.mode !== "tui" && !ctx.hasUI) return;
+  let canNotify: boolean;
+  try {
+    canNotify = ctx.mode === "tui" || ctx.hasUI;
+  } catch {
+    return;
+  }
+  if (!canNotify) return;
   const warnings = collectWarnings(usage, nowMs);
   for (const warning of warnings) {
     const key = `${warning.provider}:${warning.windowLabel}`;

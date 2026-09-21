@@ -35,6 +35,7 @@ import {
   type SessionManagerLike,
 } from "../core/credentials.js";
 import { evaluateWarnings } from "../core/warnings.js";
+import { createSessionLiveness, isStaleContextError } from "../core/liveness.js";
 
 const EXTENSION_ID = "pi-usage-hub";
 /**
@@ -61,6 +62,11 @@ let pendingVirtual: { virtualProviderId: string; backendLabels: string[] } | und
 
 export default function usageHub(pi: ExtensionAPI): void {
   const state: UsageState = { usages: new Map(), available: new Map() };
+  // Tracks which session the async poll work belongs to. Pi invalidates every
+  // captured ctx/pi on /new, /resume, /fork and /reload; without this, an
+  // aborted fetch resumes after invalidation and reads ctx.mode on a dead
+  // context, throwing an unhandled "This extension ctx is stale" error.
+  const liveness = createSessionLiveness();
   let currentContext: ExtensionContext | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let sessionController: AbortController | undefined;
@@ -76,8 +82,10 @@ export default function usageHub(pi: ExtensionAPI): void {
   });
 
   // pi-multiprovider announces a service object at load and on every session
-  // start. Capture it so we can resolve the account actually in use.
-  pi.events.on(MULTIPROVIDER_SERVICE_EVENT, (value: unknown) => {
+  // start. Capture it so we can resolve the account actually in use. Note this
+  // fires for the whole process, not per session, so the handler must not act
+  // on a session that has already shut down — `poll` re-checks liveness.
+  multiproviderUnsubscribe = pi.events.on(MULTIPROVIDER_SERVICE_EVENT, (value: unknown) => {
     multiprovider = value as MultiProviderServiceAnnouncement;
     if (state.active) void poll();
   });
@@ -163,7 +171,18 @@ export default function usageHub(pi: ExtensionAPI): void {
 
   function updateStatus(): void {
     const ctx = currentContext;
-    if (!ctx || ctx.mode !== "tui") return;
+    if (!ctx) return;
+    try {
+      updateStatusWith(ctx);
+    } catch (error) {
+      // A stale context must never take the TUI down. The footer is decoration;
+      // losing one frame of it is strictly better than an unhandled throw.
+      if (!isStaleContextError(error)) throw error;
+    }
+  }
+
+  function updateStatusWith(ctx: ExtensionContext): void {
+    if (ctx.mode !== "tui") return;
     const target = state.active;
     if (!target) {
       const theme = ctx.ui.theme;
@@ -231,12 +250,19 @@ export default function usageHub(pi: ExtensionAPI): void {
       return;
     }
     pollInFlight = true;
+    // Capture the session this run belongs to. Every continuation below compares
+    // against it and abandons the run once the session has been replaced.
+    const session = liveness.current();
     try {
       do {
         pollQueued = false;
+        if (!liveness.isLive(session)) return;
         const ctx = currentContext;
         if (!ctx || ctx.mode !== "tui") return;
         const target = await resolveActiveTarget(ctx);
+        // resolveActiveTarget awaits multiprovider/session lookups, so the
+        // session may have been replaced while it was in flight.
+        if (!liveness.isLive(session)) return;
         state.active = target;
         if (!target) {
           updateStatus();
@@ -248,6 +274,10 @@ export default function usageHub(pi: ExtensionAPI): void {
           : controller.signal;
         try {
           const usage = await fetchForTarget(target, composite);
+          // The /new case: session_shutdown aborted this fetch and Pi then
+          // invalidated ctx, so this continuation is running against a dead
+          // context. Drop the result instead of touching ctx/pi.
+          if (!liveness.isLive(session)) return;
           if (!usage) continue;
           state.usages.set(target.provider, usage);
           state.available.set(target.provider, availabilityOf(usage) === "available");
@@ -259,7 +289,11 @@ export default function usageHub(pi: ExtensionAPI): void {
             usage,
           });
           void evaluateWarnings(pi, ctx, usage);
-        } catch {
+        } catch (error) {
+          // An aborted fetch during teardown is expected, not a failure worth
+          // rendering — and rendering it would access the dead context.
+          if (!liveness.isLive(session)) return;
+          if (isStaleContextError(error)) return;
           state.usages.set(target.provider, {
             provider: target.provider,
             status: "error",
@@ -328,6 +362,10 @@ export default function usageHub(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    // Opens a new epoch, invalidating any async work still running for the
+    // previous session (Pi rebinds extensions, so this instance also receives
+    // the replacement session's session_start).
+    const session = liveness.begin();
     currentContext = ctx;
     sessionController?.abort();
     sessionController = new AbortController();
@@ -368,6 +406,7 @@ export default function usageHub(pi: ExtensionAPI): void {
 
     if (ctx.mode !== "tui") return;
     state.active = await resolveActiveTarget(ctx);
+    if (!liveness.isLive(session)) return;
     updateStatus();
     void poll();
     pollTimer = setInterval(() => void poll(), POLL_INTERVAL_MS);
@@ -375,6 +414,10 @@ export default function usageHub(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    // Closing the epoch first makes every in-flight continuation bail out as
+    // soon as it resumes, so none of them can touch the context Pi is about to
+    // invalidate.
+    liveness.end();
     sessionController?.abort();
     sessionController = undefined;
     if (pollTimer) clearInterval(pollTimer);
@@ -382,12 +425,21 @@ export default function usageHub(pi: ExtensionAPI): void {
     multiproviderUnsubscribe?.();
     multiproviderUnsubscribe = undefined;
     const ctx = currentContext;
-    if (ctx?.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
+    currentContext = undefined;
+    if (!ctx) return;
+    try {
+      if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
+    } catch (error) {
+      // Best-effort cleanup; a stale context here has nothing left to clear.
+      if (!isStaleContextError(error)) throw error;
+    }
   });
 
   pi.on("model_select", async (_event, ctx) => {
+    const session = liveness.current();
     currentContext = ctx;
     state.active = await resolveActiveTarget(ctx);
+    if (!liveness.isLive(session)) return;
     updateStatus();
     void poll();
   });
