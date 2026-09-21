@@ -190,9 +190,12 @@ export default function usageHub(pi: ExtensionAPI): void {
     }
     const theme = ctx.ui.theme;
     const label = (target.virtualPrefix ?? "") + PROVIDER_LABELS[target.provider];
-    const account = shortAccountLabel(target.accountLabel, PROVIDER_LABELS[target.provider]);
-    const accountSuffix = account ? theme.fg("dim", `#${account}`) : "";
     const usage = state.usages.get(target.provider);
+    // The account tag comes from the resolved credential, never from the target:
+    // a virtual target's label names the *backend* ("Command Code ·
+    // deepseek-v4.1-flash"), not the pooled account that actually served.
+    const account = shortAccountLabel(usage?.accountLabel, PROVIDER_LABELS[target.provider]);
+    const accountSuffix = account ? theme.fg("dim", `#${account}`) : "";
 
     if (!usage) {
       ctx.ui.setStatus(STATUS_KEY, theme.fg("dim", `${label}${accountSuffix} usage: loading…`));

@@ -193,3 +193,47 @@ describe("quota warnings", () => {
     expect(warnings[0]!.message).toContain("ZAI CN");
   });
 });
+
+describe("account labelling for the footer", () => {
+  it("never uses a virtual backend label as the account tag", async () => {
+    // Regression: the footer rendered `target.accountLabel`, which for a virtual
+    // provider is the *backend* label ("Command Code · deepseek/deepseek-v4.1-flash"),
+    // so it displayed a model name as if it were the account. The account must
+    // come from the resolved credential instead.
+    const multiprovider: MultiProviderServiceAnnouncement = {
+      getMostRecentlyUsedAccount: vi
+        .fn()
+        .mockResolvedValue({ id: "pi:default", label: "hello@raenzo.com", authKind: "custom" }),
+      getActiveAccount: vi.fn().mockResolvedValue({ id: "pi:default", label: "hello@raenzo.com" }),
+    };
+    const credential = await resolveCredential({
+      piProviderIds: ["commandcode"],
+      piProviderId: "commandcode",
+      registry: { getApiKeyForProvider: vi.fn().mockResolvedValue("user_5vSAWk3cZJzdG") },
+      multiprovider,
+      multiproviderContext: {},
+    });
+    // The upstream account has no stored token, but its label must still be
+    // reported so the footer can name the credential that actually served.
+    expect(credential.source).toBe("model-registry");
+    expect(credential.accountLabel).toBe("hello@raenzo.com");
+    expect(credential.accountId).toBe("pi:default");
+  });
+
+  it("prefers the most recently used account over the affinity pin", async () => {
+    const multiprovider: MultiProviderServiceAnnouncement = {
+      getMostRecentlyUsedAccount: vi.fn().mockResolvedValue({ id: "acc-b", label: "github" }),
+      getActiveAccount: vi.fn().mockResolvedValue({ id: "acc-a", label: "google" }),
+      resolveActiveAccountAuth: vi.fn().mockResolvedValue({ accessToken: "tok-b", label: "github" }),
+    };
+    const credential = await resolveCredential({
+      piProviderIds: ["commandcode"],
+      piProviderId: "commandcode",
+      registry: {},
+      multiprovider,
+      multiproviderContext: {},
+    });
+    expect(credential.accountLabel).toBe("github");
+    expect(credential.source).toBe("multiprovider");
+  });
+});
