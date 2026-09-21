@@ -84,7 +84,7 @@ export function applyCodeBuddyPackageDetails(packages: CodeBuddyPackage[], paylo
   });
 }
 
-/** Convert packages into quota windows: one per package plus a combined total. */
+/** Convert packages into quota windows: a combined total plus one per package. */
 export function codeBuddyWindows(packages: CodeBuddyPackage[]): QuotaWindow[] {
   const windows: QuotaWindow[] = [];
   const totalRemaining = packages.reduce((sum, entry) => sum + Math.max(0, entry.remaining), 0);
@@ -105,6 +105,9 @@ export function codeBuddyWindows(packages: CodeBuddyPackage[]): QuotaWindow[] {
     note: `${totalRemaining.toFixed(2)} / ${totalCapacity.toFixed(2)} credits`,
   });
 
+  // Credit packages are alternatives: spending comes out of whichever package
+  // still has credits, so an exhausted package must not make the provider look
+  // exhausted while another package has room. Each gets its own group.
   for (const entry of packages) {
     windows.push({
       label: entry.name ?? entry.packageCode,
@@ -114,6 +117,7 @@ export function codeBuddyWindows(packages: CodeBuddyPackage[]): QuotaWindow[] {
       limitValue: entry.total,
       limited: entry.remaining <= 0,
       isBalance: true,
+      group: `package:${entry.packageCode}`,
       kind: "balance",
       note: `${entry.remaining.toFixed(2)} / ${entry.total.toFixed(2)} ${entry.unit}`,
     });

@@ -79,6 +79,9 @@ export function parseAntigravityQuotaSummary(payload: unknown): QuotaWindow[] {
         usedValue: 100 - remainingPercent,
         limitValue: 100,
         limited: remainingPercent <= 0,
+        // Gemini and Claude/GPT are independent pools: exhausting one does not
+        // exhaust the other. Within a pool the 5h and weekly buckets both apply.
+        group: shortGroupName(groupName),
         kind: "quota",
       });
     }

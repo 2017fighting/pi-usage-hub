@@ -8,6 +8,7 @@ import {
   isExhausted,
   availabilityOf,
   soonestReset,
+  soonestUsableReset,
   sortUsages,
 } from "../src/core/format.js";
 import type { ProviderUsage, QuotaWindow } from "../src/core/types.js";
@@ -122,7 +123,72 @@ describe("availability and sorting", () => {
     expect(soonestReset(usage("zai-coding-cn", [quota(50)]))).toBeUndefined();
   });
 
-  it("puts available first, then exhausted by soonest reset, then unknown last", () => {
+  it("treats the ZAI 5h + weekly windows as one AND-group", () => {
+    // Regression: a live ZAI account with the 5h window at 4% and the weekly
+    // window at 100% answers coding requests with HTTP 429 "weekly limit
+    // reached", so it must NOT be reported as available.
+    const zai = usage("zai-coding-cn", [
+      { ...quota(4, 1_000_000, "5h"), windowSeconds: 5 * 3600 },
+      { ...quota(100, 5_000_000, "Weekly"), windowSeconds: 7 * 86_400 },
+    ]);
+    expect(availabilityOf(zai)).toBe("exhausted");
+
+    // And the wait is until the WEEKLY reset, not the earlier 5h reset.
+    expect(soonestUsableReset(zai)).toBe(5_000_000);
+  });
+
+  it("ignores non-gating informational windows", () => {
+    // ZAI's monthly web-search quota does not gate coding calls.
+    const zai = usage("zai-coding-cn", [
+      quota(4, 1_000_000, "5h"),
+      quota(20, 2_000_000, "Weekly"),
+      { ...quota(100, 3_000_000, "Web / month"), gating: false },
+    ]);
+    expect(availabilityOf(zai)).toBe("available");
+  });
+
+  it("treats independent groups as alternatives (OR)", () => {
+    // Antigravity: Gemini pool exhausted, Claude/GPT pool has room.
+    const antigravity = usage("antigravity", [
+      { ...quota(100, 1_000_000, "Gemini 5h"), group: "Gemini" },
+      { ...quota(100, 2_000_000, "Gemini Weekly"), group: "Gemini" },
+      { ...quota(20, 3_000_000, "Claude/GPT 5h"), group: "Claude/GPT" },
+      { ...quota(41, 4_000_000, "Claude/GPT Weekly"), group: "Claude/GPT" },
+    ]);
+    expect(availabilityOf(antigravity)).toBe("available");
+
+    // With both pools exhausted, the wait is the soonest pool to recover.
+    const bothGone = usage("antigravity", [
+      { ...quota(100, 1_000_000), group: "Gemini" },
+      { ...quota(100, 2_000_000), group: "Gemini" },
+      { ...quota(100, 3_000_000), group: "Claude/GPT" },
+      { ...quota(100, 5_000_000), group: "Claude/GPT" },
+    ]);
+    expect(availabilityOf(bothGone)).toBe("exhausted");
+    // The provider returns as soon as ANY pool is fully unblocked: Gemini's
+    // blocking window resets at 2M, Claude/GPT's at 5M, so 2M wins.
+    expect(soonestUsableReset(bothGone)).toBe(2_000_000);
+  });
+
+  it("treats credit packages as alternatives (OR)", () => {
+    const codebuddy = usage("codebuddy", [
+      { label: "Total", balanceValue: 100, limited: false, isBalance: true, kind: "balance" },
+      { label: "pkg-a", balanceValue: 0, limited: true, isBalance: true, kind: "balance", group: "package:a" },
+      { label: "pkg-b", balanceValue: 100, limited: false, isBalance: true, kind: "balance", group: "package:b" },
+    ]);
+    expect(availabilityOf(codebuddy)).toBe("available");
+  });
+
+  it("excludes never-recovering groups from the reset estimate", () => {
+    // An exhausted prepaid balance with no reset time cannot say when it returns.
+    const props = usage("deepseek", [
+      { label: "Balance", balanceValue: -0.2, limited: true, isBalance: true, kind: "balance" },
+    ]);
+    expect(availabilityOf(props)).toBe("exhausted");
+    expect(soonestUsableReset(props)).toBeUndefined();
+  });
+
+  it("puts available first, then exhausted by soonest usable reset, then unknown last", () => {
     const available = usage("kimi-coding", [quota(10)]);
     const exhaustedLate = usage("zai-coding-cn", [quota(100, 9000)]);
     const exhaustedSoon = usage("codebuddy", [quota(100, 1000)]);
@@ -137,6 +203,15 @@ describe("availability and sorting", () => {
       "commandcode", // exhausted, no reset -> last among exhausted
       "deepseek", // unknown
     ]);
+  });
+
+  it("orders a multi-window provider by its blocking window's reset", () => {
+    // ZAI: 5h resets in 1h but weekly is the blocker and resets in 10h, while
+    // CodeBuddy resets in 4h. CodeBuddy must sort first.
+    const zai = usage("zai-coding-cn", [quota(100, 3_600_000, "5h"), quota(100, 36_000_000, "Weekly")]);
+    const codebuddy = usage("codebuddy", [quota(100, 14_400_000)]);
+    const sorted = sortUsages([zai, codebuddy]);
+    expect(sorted.map((entry) => entry.provider)).toEqual(["codebuddy", "zai-coding-cn"]);
   });
 
   it("orders available providers by registry configuration order", () => {

@@ -76,6 +76,10 @@ export function parseZaiCodingCn(payload: unknown): QuotaWindow[] {
         usedValue: used,
         limitValue: limit,
         limited: used >= limit,
+        // The monthly web-search quota covers search-prime / web-reader / zread
+        // and does not gate coding requests, so it must never make the provider
+        // look unusable on its own.
+        gating: false,
         kind: "quota",
       });
     }

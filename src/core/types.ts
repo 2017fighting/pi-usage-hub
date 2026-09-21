@@ -73,7 +73,12 @@ export interface QuotaWindow {
   isCurrency?: boolean;
   /** ISO currency code when isCurrency. */
   currency?: string;
-  /** True when the window is demonstrably exhausted (usedPercent >= 100 or balance <= 0). */
+  /**
+   * True when this specific window has no room left (usedPercent >= 100, or a
+   * balance at/below zero). A provider can still be usable when another group
+   * has room, so availability must be computed with `availabilityOf`, never from
+   * a single window.
+   */
   limited?: boolean;
   /** True when the provider exposes no meaningful percentage and only a balance. */
   isBalance?: boolean;
@@ -81,6 +86,19 @@ export interface QuotaWindow {
   balanceValue?: number;
   /** Optional extra detail line (e.g. "topped-up $10.00 · granted $5.00"). */
   note?: string;
+  /**
+   * Windows sharing a group must ALL have room for the provider to be usable
+   * (logical AND) — this is how a 5h window and a weekly cap combine. Separate
+   * groups are alternatives (logical OR): CodeBuddy credit packages, and
+   * Antigravity's independent Gemini vs Claude/GPT pools.
+   */
+  group?: string;
+  /**
+   * Whether this window gates usability. Defaults to true. Set false for
+   * informational windows that do not block the provider, e.g. ZAI's monthly
+   * web-search quota, which has no bearing on coding requests.
+   */
+  gating?: boolean;
   kind: WindowKind;
 }
 

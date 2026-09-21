@@ -64,32 +64,107 @@ export function formatReset(resetsAt: number | undefined, nowMs = Date.now()): s
   return `${absolute} (${countdown})`;
 }
 
-/** True when the provider has no quota left anywhere: every window limited, or a balance at/below zero. */
+/** True when a single window has no room left. */
+export function isWindowExhausted(window: QuotaWindow): boolean {
+  if (window.kind === "balance") {
+    if (window.limited === true) return true;
+    return window.balanceValue !== undefined && window.balanceValue <= 0;
+  }
+  if (window.limited === true) return true;
+  return window.usedPercent !== undefined && window.usedPercent >= 100;
+}
+
+/** Gating windows only: informational windows (e.g. a web-search quota) never block usage. */
+export function gatingWindows(windows: QuotaWindow[]): QuotaWindow[] {
+  return windows.filter((window) => window.gating !== false);
+}
+
+/**
+ * True when every gating window is used up.
+ *
+ * Prefer `availabilityOf`, which additionally accounts for independent groups.
+ */
 export function isExhausted(windows: QuotaWindow[]): boolean {
-  if (windows.length === 0) return false;
-  return windows.every((window) => {
-    if (window.kind === "balance") {
-      return window.limited === true || (window.usedValue !== undefined && window.usedValue <= 0);
-    }
-    return window.limited === true || (window.usedPercent !== undefined && window.usedPercent >= 100);
-  });
+  const gating = gatingWindows(windows);
+  if (gating.length === 0) return false;
+  return gating.every(isWindowExhausted);
+}
+
+/**
+ * Usability across grouped windows.
+ *
+ * Within a group every window must have room (a 5h cap and a weekly cap both
+ * apply to the same request). Between groups, having any one group with room is
+ * enough (separate credit packages, or Antigravity's independent pools).
+ * Windows without a group share one implicit group.
+ */
+export function hasUsableGroup(windows: QuotaWindow[]): boolean {
+  const gating = gatingWindows(windows);
+  if (gating.length === 0) return false;
+  const groups = new Map<string, QuotaWindow[]>();
+  for (const window of gating) {
+    const key = window.group ?? "";
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(window);
+    else groups.set(key, [window]);
+  }
+  for (const bucket of groups.values()) {
+    if (bucket.every((window) => !isWindowExhausted(window))) return true;
+  }
+  return false;
 }
 
 /**
  * Availability of a provider for /usage grouping.
  * - `unknown`: unconfigured/unsupported/error — cannot judge.
- * - `exhausted`: every window is used up.
- * - `available`: at least one window still has room.
+ * - `exhausted`: no group still has room in every one of its windows.
+ * - `available`: at least one group has room in all of its windows.
  */
 export function availabilityOf(usage: ProviderUsage): Availability {
   if (usage.status !== "ok") return "unknown";
   if (usage.windows.length === 0) return "unknown";
-  return isExhausted(usage.windows) ? "exhausted" : "available";
+  return hasUsableGroup(usage.windows) ? "available" : "exhausted";
 }
 
 /**
- * The soonest reset across a provider's windows. Used to sort the unavailable
- * group so the provider that comes back first is listed first.
+ * The reset that matters for "when can I use this again", i.e. the soonest time
+ * at which every gating window of some group is unblocked. An exhausted provider
+ * waiting on a weekly cap reports the weekly reset, not an earlier 5h reset that
+ * would leave it still blocked.
+ */
+export function soonestUsableReset(
+  usage: ProviderUsage,
+  nowMs = Date.now(),
+): number | undefined {
+  const gating = gatingWindows(usage.windows);
+  if (gating.length === 0) return undefined;
+
+  const groups = new Map<string, QuotaWindow[]>();
+  for (const window of gating) {
+    const key = window.group ?? "";
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(window);
+    else groups.set(key, [window]);
+  }
+
+  // A group becomes usable when its LAST blocked window resets.
+  const candidates: number[] = [];
+  for (const bucket of groups.values()) {
+    const blocked = bucket.filter(isWindowExhausted);
+    if (blocked.length === 0) continue;
+    const resets = blocked.map((window) => window.resetsAt);
+    // A blocked window with no reset time (an exhausted prepaid balance) never
+    // becomes usable on its own; such a group is excluded from the minimum.
+    if (resets.some((reset) => reset === undefined)) continue;
+    candidates.push(Math.max(...(resets as number[])));
+  }
+  if (candidates.length === 0) return undefined;
+  return Math.min(...candidates);
+}
+
+/**
+ * The soonest reset across a provider's windows, used as a fallback when
+ * `soonestUsableReset` has nothing to report.
  */
 export function soonestReset(usage: ProviderUsage): number | undefined {
   const resets = usage.windows
@@ -119,8 +194,8 @@ export function sortUsages(usages: ProviderUsage[]): ProviderUsage[] {
     if (rank(aAvail) !== rank(bAvail)) return rank(aAvail) - rank(bAvail);
 
     if (aAvail === "exhausted") {
-      const aReset = soonestReset(a);
-      const bReset = soonestReset(b);
+      const aReset = soonestUsableReset(a);
+      const bReset = soonestUsableReset(b);
       if (aReset === undefined && bReset === undefined) return orderIndex(a.provider) - orderIndex(b.provider);
       if (aReset === undefined) return 1;
       if (bReset === undefined) return -1;

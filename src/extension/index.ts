@@ -22,7 +22,7 @@ import { Container, Input, Spacer, Text, type Focusable, type TUI } from "@earen
 
 import type { ProviderKey, ProviderUsage } from "../core/types.js";
 import { PROVIDER_LABELS, PROVIDER_ORDER } from "../core/types.js";
-import { availabilityOf, sortUsages } from "../core/format.js";
+import { availabilityOf, sortUsages, soonestUsableReset } from "../core/format.js";
 import { formatWindow, shortReset, worstPercent, colorForPercent, renderBar } from "../core/render.js";
 import { resolveEndpoints } from "../core/endpoints.js";
 import { PROVIDERS, detectProviderKey, providerByKey } from "../providers/registry.js";
@@ -242,9 +242,7 @@ export default function usageHub(pi: ExtensionAPI): void {
   }
 
   function pickHeadline(usage: ProviderUsage) {
-    const quotaWindows = usage.windows.filter((window) => window.kind === "quota");
-    const pool = quotaWindows.length > 0 ? quotaWindows : usage.windows;
-    return [...pool].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0];
+    return pickHeadlineWindow(usage);
   }
 
   async function poll(): Promise<void> {
@@ -715,9 +713,16 @@ class UsageDashboardComponent extends Container implements Focusable {
   }
 }
 
+/**
+ * The window that best summarises a provider in one line: the most-consumed
+ * gating window. Informational windows (ZAI's monthly web quota) are excluded so
+ * they can never headline the footer, and balance rows are used only when the
+ * provider has nothing else.
+ */
 function pickHeadlineWindow(usage: ProviderUsage) {
-  const quotaWindows = usage.windows.filter((window) => window.kind === "quota");
-  const pool = quotaWindows.length > 0 ? quotaWindows : usage.windows;
+  const gating = usage.windows.filter((window) => window.gating !== false);
+  const quotaWindows = gating.filter((window) => window.kind === "quota");
+  const pool = quotaWindows.length > 0 ? quotaWindows : gating.length > 0 ? gating : usage.windows;
   return [...pool].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0];
 }
 
