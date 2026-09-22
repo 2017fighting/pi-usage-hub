@@ -4,8 +4,8 @@
  */
 
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import type { QuotaWindow } from "./types.js";
-import { clampPercent, formatReset } from "./format.js";
+import type { AccountUsage, ProviderUsage, QuotaWindow } from "./types.js";
+import { accountUsable, availabilityOf, clampPercent, formatReset } from "./format.js";
 
 /** Theme colour name for a used-percentage, following the shared 70/90 thresholds. */
 export function colorForPercent(percent: number): ThemeColor {
@@ -181,4 +181,137 @@ export function shortReset(resetsAt: number | undefined, nowMs = Date.now()): st
   if (!formatted) return undefined;
   const match = formatted.match(/\(([^)]+)\)$/);
   return match ? match[1] : formatted;
+}
+
+/* -------------------------------------------------------------------------- *
+ * Pooled accounts
+ *
+ * A multiprovider pool has one credential per account, and therefore one
+ * independent quota per account. These helpers render that breakdown; they are
+ * pure so the layout can be asserted without a TUI.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * The label to print for a pooled account.
+ *
+ * The operator-set label from /multilogin is what they recognise ("google"),
+ * so it is preferred; the raw account id is only a fallback for an unlabelled
+ * account.
+ */
+export function accountDisplayLabel(account: Pick<AccountUsage, "accountId" | "accountLabel">): string {
+  const label = account.accountLabel.trim();
+  return label === "" ? account.accountId : label;
+}
+
+/**
+ * The status dot for one account.
+ *
+ * Green only when the account can actually serve a request right now, which
+ * requires both quota and pool health — a cooled-down account with an empty bar
+ * is not usable, and showing it green would contradict the `cooling` tag beside
+ * it.
+ */
+export function accountBadge(theme: Theme, account: AccountUsage): string {
+  if (accountUsable(account)) return theme.fg("success", "●");
+  if (availabilityOf(account.usage) === "unknown") return theme.fg("dim", "○");
+  return theme.fg("error", "●");
+}
+
+/**
+ * Multiprovider pool-health tag for an account row, e.g. ` cooling 12m`.
+ *
+ * Local cooldowns are shown explicitly because they are invisible in quota: an
+ * account can be at 0% used and still be skipped by the scheduler, and without
+ * this tag that looks like a bug.
+ */
+export function poolStatusTag(theme: Theme, account: AccountUsage, nowMs = Date.now()): string {
+  if (account.poolStatus === "disabled") return theme.fg("dim", " disabled");
+  if (account.cooldownMs !== undefined && account.cooldownMs > 0) {
+    return theme.fg("warning", ` cooling ${shortReset(nowMs + account.cooldownMs, nowMs)}`);
+  }
+  return "";
+}
+
+/**
+ * The window that best collapses a provider or account into a single line: the
+ * most-consumed gating quota window. Informational windows (ZAI's monthly web
+ * quota) are excluded, and balance rows are used only when nothing else exists.
+ */
+export function headlineWindow(usage: ProviderUsage): QuotaWindow | undefined {
+  if (usage.status !== "ok" || usage.windows.length === 0) return undefined;
+  const gating = usage.windows.filter((window) => window.gating !== false);
+  const quotaWindows = gating.filter((window) => window.kind === "quota" && window.usedPercent !== undefined);
+  const pool = quotaWindows.length > 0 ? quotaWindows : gating.length > 0 ? gating : usage.windows;
+  return [...pool].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0];
+}
+
+/**
+ * A provider's or account's windows as one compact line, e.g.
+ * `5h 21% · ⟳4h 34m`. Used for collapsed rows so a pool does not push every
+ * other provider out of the viewport.
+ */
+export function formatHeadlineLine(
+  theme: Theme,
+  usage: ProviderUsage,
+  nowMs = Date.now(),
+): string | undefined {
+  const window = headlineWindow(usage);
+  if (!window) return undefined;
+  const percent = window.usedPercent;
+  const text =
+    percent !== undefined
+      ? `${window.label} ${Math.round(percent)}%`
+      : `${window.label} ${window.note ?? ""}`.trim();
+  if (text === "") return undefined;
+  const reset = shortReset(window.resetsAt, nowMs);
+  return theme.fg("dim", text + (reset ? ` · ⟳${reset}` : ""));
+}
+
+export interface AccountRowOptions {
+  /** Column width for the label, so a pool's dots line up. */
+  labelWidth?: number;
+  /** Expanded rows list every window; collapsed rows show one headline line. */
+  expanded?: boolean;
+  /** Indent for the label line; window lines indent two spaces further. */
+  indent?: string;
+  nowMs?: number;
+}
+
+/**
+ * The lines describing one pooled account: its label with a pool-health tag,
+ * then its windows (or an error, or a single collapsed line).
+ */
+export function formatAccountRow(
+  theme: Theme,
+  account: AccountUsage,
+  options: AccountRowOptions = {},
+): string[] {
+  const { labelWidth = 0, expanded = false, indent = "      ", nowMs = Date.now() } = options;
+  const label = accountDisplayLabel(account).padEnd(labelWidth);
+  const inUse = account.inUse ? theme.fg("success", " ✓") : "";
+  const lines = [
+    `${indent}${accountBadge(theme, account)} ${theme.fg("muted", label)}${poolStatusTag(theme, account, nowMs)}${inUse}`,
+  ];
+  const body = `${indent}  `;
+
+  if (account.usage.status !== "ok") {
+    if (expanded) {
+      const message =
+        account.usage.status === "unconfigured" ? "not configured" : account.usage.error ?? account.usage.status;
+      lines.push(body + theme.fg("dim", message));
+    }
+    return lines;
+  }
+
+  if (!expanded) {
+    const headline = formatHeadlineLine(theme, account.usage, nowMs);
+    if (headline) lines.push(body + headline);
+    return lines;
+  }
+
+  for (const window of account.usage.windows) {
+    lines.push(body + formatWindow(theme, window, { barWidth: 14, nowMs }));
+  }
+  if (account.usage.notice) lines.push(body + theme.fg("muted", account.usage.notice));
+  return lines;
 }

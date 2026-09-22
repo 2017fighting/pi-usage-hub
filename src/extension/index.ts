@@ -20,15 +20,27 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Input, Spacer, Text, type Focusable, type TUI } from "@earendil-works/pi-tui";
 
-import type { ProviderKey, ProviderUsage } from "../core/types.js";
+import type { AccountUsage, ProviderKey, ProviderUsage } from "../core/types.js";
 import { PROVIDER_LABELS, PROVIDER_ORDER } from "../core/types.js";
-import { availabilityOf, sortUsages, soonestUsableReset } from "../core/format.js";
-import { formatWindow, formatFooterSummary, shortReset, colorForPercent, renderBar } from "../core/render.js";
+import { accountUsable, availabilityOf, sortUsages, soonestUsableReset } from "../core/format.js";
+import {
+  accountDisplayLabel,
+  formatAccountRow,
+  formatHeadlineLine,
+  formatWindow,
+  formatFooterSummary,
+  shortReset,
+  colorForPercent,
+  renderBar,
+} from "../core/render.js";
 import { resolveEndpoints } from "../core/endpoints.js";
 import { PROVIDERS, providerByKey } from "../providers/registry.js";
 import { resolveTarget, shortAccountLabel, type ActiveTarget } from "../core/target.js";
 import {
   MULTIPROVIDER_SERVICE_EVENT,
+  isUpstreamAccount,
+  listPoolAccounts,
+  resolveAccountCredential,
   resolveCredential,
   type MultiProviderServiceAnnouncement,
   type ModelRegistryLike,
@@ -309,56 +321,179 @@ export default function usageHub(pi: ExtensionAPI): void {
     }
   }
 
-  /** Fetch every provider concurrently for the /usage dashboard. */
+  /**
+   * Fetch every provider concurrently for the /usage dashboard.
+   *
+   * A multiprovider-pooled provider is fetched once *per account*, because each
+   * account carries its own credential and therefore its own independent quota.
+   * Fetching only the serving account — as the footer poll deliberately does —
+   * cannot answer "how much is left on my other two CommandCode accounts".
+   */
   async function fetchAll(ctx: ExtensionContext, signal: AbortSignal): Promise<ProviderUsage[]> {
     const endpoints = resolveEndpoints(process.env);
     const results = await Promise.all(
-      PROVIDERS.map(async (descriptor): Promise<ProviderUsage> => {
-        // Skip fetching providers that are not configured at all.
-        const credential = await resolveCredential({
-          piProviderIds: descriptor.piProviderIds,
-          piProviderId: descriptor.piProviderIds[0],
-          modelId: ctx.model?.id,
-          registry: registryOf(ctx),
-          sessionManager: sessionsOf(ctx),
-          multiprovider,
-          multiproviderContext: ctx,
-          signal,
-          env: process.env,
-        });
-        if (!credential.token) {
-          return {
-            provider: descriptor.key,
-            status: "unconfigured",
-            windows: [],
-            fetchedAt: Date.now(),
-          };
-        }
-        try {
-          const usage = await descriptor.fetch(
-            credential.token,
-            { signal, env: process.env },
-            endpoints,
-            { piProviderId: descriptor.piProviderIds[0] },
-          );
-          return {
-            ...usage,
-            accountId: credential.accountId,
-            accountLabel: credential.accountLabel,
-            cooldownMs: credential.cooldownMs,
-          };
-        } catch (error) {
-          return {
-            provider: descriptor.key,
-            status: "error",
-            windows: [],
-            error: error instanceof Error ? error.message : String(error),
-            fetchedAt: Date.now(),
-          };
-        }
-      }),
+      PROVIDERS.map((descriptor) => fetchProvider(ctx, descriptor, endpoints, signal)),
     );
     return results;
+  }
+
+  async function fetchProvider(
+    ctx: ExtensionContext,
+    descriptor: (typeof PROVIDERS)[number],
+    endpoints: ReturnType<typeof resolveEndpoints>,
+    signal: AbortSignal,
+  ): Promise<ProviderUsage> {
+    const piProviderId = descriptor.piProviderIds[0]!;
+    const accounts = await listPoolAccounts(multiprovider, piProviderId);
+
+    if (accounts && accounts.length > 0) {
+      const servingId = await resolveServingAccountId(ctx, piProviderId);
+      const accountUsages = await Promise.all(
+        accounts.map((account) =>
+          fetchOneAccount(ctx, descriptor, account, endpoints, signal, servingId),
+        ),
+      );
+      return aggregateProvider(descriptor.key, accountUsages);
+    }
+
+    // Not pooled (or multiprovider absent): one credential, one row.
+    const credential = await resolveCredential({
+      piProviderIds: descriptor.piProviderIds,
+      piProviderId,
+      modelId: ctx.model?.id,
+      registry: registryOf(ctx),
+      sessionManager: sessionsOf(ctx),
+      multiprovider,
+      multiproviderContext: ctx,
+      signal,
+      env: process.env,
+    });
+    if (!credential.token) {
+      return { provider: descriptor.key, status: "unconfigured", windows: [], fetchedAt: Date.now() };
+    }
+    try {
+      const usage = await descriptor.fetch(
+        credential.token,
+        { signal, env: process.env },
+        endpoints,
+        { piProviderId },
+      );
+      return {
+        ...usage,
+        accountId: credential.accountId,
+        accountLabel: credential.accountLabel,
+        cooldownMs: credential.cooldownMs,
+      };
+    } catch (error) {
+      return {
+        provider: descriptor.key,
+        status: "error",
+        windows: [],
+        error: error instanceof Error ? error.message : String(error),
+        fetchedAt: Date.now(),
+      };
+    }
+  }
+
+  /**
+   * The account that served the session's most recent request, used to mark one
+   * pool row with `✓`. Prefers the most recently leased account (the credential
+   * actually spent) over the affinity pin, matching `resolveCredential`.
+   */
+  async function resolveServingAccountId(
+    ctx: ExtensionContext,
+    poolId: string,
+  ): Promise<string | undefined> {
+    if (!multiprovider) return undefined;
+    try {
+      const account =
+        (await multiprovider.getMostRecentlyUsedAccount?.(poolId)) ??
+        (await multiprovider.getActiveAccount?.(poolId, ctx));
+      return account?.id;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Fetch one pool account's usage with that account's own credential. */
+  async function fetchOneAccount(
+    ctx: ExtensionContext,
+    descriptor: (typeof PROVIDERS)[number],
+    account: { id: string; label: string; status?: string; cooldownMs?: number },
+    endpoints: ReturnType<typeof resolveEndpoints>,
+    signal: AbortSignal,
+    servingId: string | undefined,
+  ): Promise<AccountUsage> {
+    const piProviderId = descriptor.piProviderIds[0]!;
+    const cooldownMs = account.cooldownMs !== undefined && account.cooldownMs > 0 ? account.cooldownMs : undefined;
+    const poolStatus = account.status === "disabled" ? "disabled" : cooldownMs ? "cooldown" : "ready";
+    const shared = {
+      accountId: account.id,
+      accountLabel: account.label,
+      poolStatus,
+      ...(cooldownMs === undefined ? {} : { cooldownMs }),
+      ...(isUpstreamAccount(account.id) ? { isUpstream: true } : {}),
+      ...(servingId === account.id ? { inUse: true } : {}),
+    } as const;
+
+    const credential = await resolveAccountCredential({
+      piProviderId,
+      accountId: account.id,
+      registry: registryOf(ctx),
+      multiprovider,
+      multiproviderContext: ctx,
+      signal,
+      env: process.env,
+    });
+    if (!credential.token) {
+      return {
+        ...shared,
+        usage: { provider: descriptor.key, status: "unconfigured", windows: [], fetchedAt: Date.now() },
+      };
+    }
+    try {
+      const usage = await descriptor.fetch(
+        credential.token,
+        { signal, env: process.env },
+        endpoints,
+        { piProviderId },
+      );
+      return { ...shared, usage };
+    } catch (error) {
+      return {
+        ...shared,
+        usage: {
+          provider: descriptor.key,
+          status: "error",
+          windows: [],
+          error: error instanceof Error ? error.message : String(error),
+          fetchedAt: Date.now(),
+        },
+      };
+    }
+  }
+
+  /**
+   * Fold per-account results into the provider row.
+   *
+   * The top-level fields keep describing the *serving* account, so the footer
+   * path and every existing renderer keep working unchanged; `accounts` carries
+   * the full breakdown for the dashboard.
+   */
+  function aggregateProvider(key: ProviderKey, accounts: AccountUsage[]): ProviderUsage {
+    const serving =
+      accounts.find((account) => account.inUse) ??
+      accounts.find((account) => account.usage.status === "ok") ??
+      accounts[0]!;
+    return {
+      ...serving.usage,
+      provider: key,
+      accountId: serving.accountId,
+      accountLabel: serving.accountLabel,
+      ...(serving.cooldownMs === undefined ? {} : { cooldownMs: serving.cooldownMs }),
+      accounts,
+      pooled: true,
+    };
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -474,12 +609,40 @@ export function renderPlainSummary(usages: ProviderUsage[]): string {
       const label = PROVIDER_LABELS[usage.provider];
       const availability = availabilityOf(usage);
       const badge = availability === "available" ? "OK" : availability === "exhausted" ? "EXHAUSTED" : "?";
-      const windows = usage.windows
-        .map((window) => `${window.label} ${window.usedPercent !== undefined ? `${Math.round(window.usedPercent)}%` : "—"}`)
-        .join(", ");
-      return `${label} [${badge}] ${usage.status === "ok" ? windows : usage.error ?? usage.status}`;
+      const line = `${label} [${badge}] ${describeUsage(usage)}`;
+      const accounts = usage.accounts;
+      if (!accounts || accounts.length === 0) return line;
+      // Indent one line per account so a non-interactive /usage still lists every
+      // pooled credential rather than a single aggregate.
+      const rows = accounts.map((account) => {
+        const status = accountStatusPlain(account);
+        const usable = accountUsable(account) ? "OK" : availabilityOf(account.usage) === "unknown" ? "?" : "EXHAUSTED";
+        const inUse = account.inUse ? " ✓" : "";
+        return `  - ${accountDisplayLabel(account)} [${usable}${status}]${inUse} ${describeUsage(account.usage)}`;
+      });
+      return [line, ...rows].join("\n");
     })
     .join("\n");
+}
+
+/** One provider's or account's windows as a single plain-text line. */
+function describeUsage(usage: ProviderUsage): string {
+  if (usage.status !== "ok") return usage.error ?? usage.status;
+  return usage.windows
+    .map(
+      (window) =>
+        `${window.label} ${window.usedPercent !== undefined ? `${Math.round(window.usedPercent)}%` : window.note ?? "—"}`,
+    )
+    .join(", ");
+}
+
+/** Plain-text pool-health tag: `, cooling 12m` / `, disabled`. */
+function accountStatusPlain(account: AccountUsage): string {
+  if (account.poolStatus === "disabled") return ", disabled";
+  if (account.cooldownMs !== undefined && account.cooldownMs > 0) {
+    return `, cooling ${shortReset(Date.now() + account.cooldownMs)}`;
+  }
+  return "";
 }
 
 /** The /usage dashboard: available providers first, exhausted by reset time. */
@@ -600,7 +763,15 @@ class UsageDashboardComponent extends Container implements Focusable {
       ? this.usages.filter(
           (usage) =>
             PROVIDER_LABELS[usage.provider].toLowerCase().includes(normalized) ||
-            usage.provider.includes(normalized),
+            usage.provider.includes(normalized) ||
+            // Account labels are how a pooled provider is actually identified by
+            // the operator, so "github" must find the CommandCode pool holding
+            // it. Filtering only on the provider name would hide that row.
+            usage.accounts?.some(
+              (account) =>
+                account.accountLabel.toLowerCase().includes(normalized) ||
+                account.accountId.toLowerCase().includes(normalized),
+            ) === true,
         )
       : this.usages;
     this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filtered.length - 1));
@@ -628,12 +799,44 @@ class UsageDashboardComponent extends Container implements Focusable {
           : theme.fg("dim", "○");
     const pointer = selected ? theme.fg("accent", "→ ") : "  ";
     const activeBadge = this.activeProvider === usage.provider ? theme.fg("success", " ✓") : "";
-    const accountTag = shortAccountLabel(usage.accountLabel, PROVIDER_LABELS[usage.provider]);
-    const account = accountTag ? theme.fg("dim", `#${accountTag}`) : "";
-    const name = selected ? theme.fg("accent", theme.bold(PROVIDER_LABELS[usage.provider])) : PROVIDER_LABELS[usage.provider];
-    this.listContainer.addChild(new Text(`${pointer}${badge} ${name}${account}${activeBadge}`, 0, 0));
 
-    const indent = "      ";
+    // A pooled provider's account tag belongs on the *header* only when there is
+    // a single account to name. With several, each account is its own row below,
+    // and repeating one account's label in the header would be misleading.
+    const pooled = usage.accounts !== undefined && usage.accounts.length > 0;
+    const accountTag = pooled ? undefined : shortAccountLabel(usage.accountLabel, PROVIDER_LABELS[usage.provider]);
+    const account = accountTag ? theme.fg("dim", `#${accountTag}`) : "";
+    const poolSuffix = pooled ? theme.fg("dim", ` ×${usage.accounts!.length}`) : "";
+    const name = selected ? theme.fg("accent", theme.bold(PROVIDER_LABELS[usage.provider])) : PROVIDER_LABELS[usage.provider];
+    this.listContainer.addChild(new Text(`${pointer}${badge} ${name}${account}${poolSuffix}${activeBadge}`, 0, 0));
+
+    if (pooled) {
+      this.renderAccounts(usage.accounts!, selected);
+      return;
+    }
+
+    this.renderWindows(usage, selected, "      ");
+  }
+
+  /**
+   * One sub-row per pooled account: label, pool-health badge, and that account's
+   * own windows. This is what makes "my other two CommandCode accounts" visible
+   * — each has a separate credential and therefore a separate quota.
+   */
+  private renderAccounts(accounts: AccountUsage[], expanded: boolean): void {
+    // Pad to the widest label so the status dots form a column.
+    const labelWidth = Math.min(18, Math.max(...accounts.map((account) => accountDisplayLabel(account).length)));
+    for (const account of accounts) {
+      for (const line of formatAccountRow(this.theme, account, { labelWidth, expanded })) {
+        this.listContainer.addChild(new Text(line, 0, 0));
+      }
+    }
+    if (expanded) this.listContainer.addChild(new Spacer(1));
+  }
+
+  /** The non-account rows of a provider: its windows, notice, and cooldown. */
+  private renderWindows(usage: ProviderUsage, selected: boolean, indent: string): void {
+    const theme = this.theme;
     if (usage.status !== "ok") {
       const message = usage.status === "unconfigured" ? "not configured" : usage.error ?? usage.status;
       this.listContainer.addChild(new Text(indent + theme.fg("dim", message), 0, 0));
@@ -641,18 +844,8 @@ class UsageDashboardComponent extends Container implements Focusable {
     }
     if (!selected && usage.windows.length > 0) {
       // Collapsed rows show a compact single line so the whole list fits.
-      const first = pickHeadlineWindow(usage);
-      if (first) {
-        const percent = first.usedPercent;
-        const text =
-          percent !== undefined
-            ? `${first.label} ${Math.round(percent)}%`
-            : `${first.label} ${first.note ?? ""}`.trim();
-        const reset = shortReset(first.resetsAt);
-        this.listContainer.addChild(
-          new Text(indent + theme.fg("dim", text + (reset ? ` · ⟳${reset}` : "")), 0, 0),
-        );
-      }
+      const headline = formatHeadlineLine(theme, usage);
+      if (headline) this.listContainer.addChild(new Text(indent + headline, 0, 0));
       return;
     }
     for (const window of usage.windows) {
@@ -754,18 +947,6 @@ class UsageDashboardComponent extends Container implements Focusable {
     this.disposed = true;
     this.requestController.abort();
   }
-}
-
-/**
- * The window that best collapses a provider into a single dashboard line: the
- * most-consumed gating quota window. Informational windows (ZAI's monthly web
- * quota) are excluded, and balance rows are used only when nothing else exists.
- */
-function pickHeadlineWindow(usage: ProviderUsage) {
-  const gating = usage.windows.filter((window) => window.gating !== false);
-  const quotaWindows = gating.filter((window) => window.kind === "quota" && window.usedPercent !== undefined);
-  const pool = quotaWindows.length > 0 ? quotaWindows : gating.length > 0 ? gating : usage.windows;
-  return [...pool].sort((a, b) => (b.usedPercent ?? 0) - (a.usedPercent ?? 0))[0];
 }
 
 export { PROVIDER_ORDER };

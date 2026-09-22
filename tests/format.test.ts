@@ -6,12 +6,13 @@ import {
   parseResetTime,
   toNumber,
   isExhausted,
+  accountUsable,
   availabilityOf,
   soonestReset,
   soonestUsableReset,
   sortUsages,
 } from "../src/core/format.js";
-import type { ProviderUsage, QuotaWindow } from "../src/core/types.js";
+import type { AccountUsage, ProviderUsage, QuotaWindow } from "../src/core/types.js";
 
 function usage(provider: ProviderUsage["provider"], windows: QuotaWindow[], status: ProviderUsage["status"] = "ok"): ProviderUsage {
   return { provider, status, windows, fetchedAt: 1_700_000_000_000 };
@@ -25,6 +26,25 @@ const quota = (usedPercent: number, resetsAt?: number, label = "5h"): QuotaWindo
   limited: usedPercent >= 100,
   kind: "quota",
 });
+
+/** One pool account, i.e. what the dashboard fetches per credential. */
+function account(
+  accountId: string,
+  windows: QuotaWindow[],
+  extra: Partial<AccountUsage> = {},
+): AccountUsage {
+  return {
+    accountId,
+    accountLabel: accountId,
+    usage: usage("commandcode", windows),
+    ...extra,
+  };
+}
+
+/** A pooled provider row wrapping per-account usage. */
+function pooled(accounts: AccountUsage[]): ProviderUsage {
+  return { provider: "commandcode", status: "ok", windows: [], fetchedAt: 1_700_000_000_000, accounts, pooled: true };
+}
 
 describe("clampPercent", () => {
   it("clamps and rounds", () => {
@@ -220,5 +240,98 @@ describe("availability and sorting", () => {
     const c = usage("codebuddy", [quota(10)]);
     const sorted = sortUsages([a, c, b]);
     expect(sorted.map((entry) => entry.provider)).toEqual(["zai-coding-cn", "codebuddy", "kimi-coding"]);
+  });
+});
+
+describe("pooled provider availability", () => {
+  it("stays available while any account in the pool has room", () => {
+    // The whole point of pooling: one account running dry is not the provider
+    // running dry. Reporting the pool exhausted here would send the operator
+    // away from a provider with two perfectly good accounts left.
+    const row = pooled([
+      account("acc1", [quota(100)], { poolStatus: "ready" }),
+      account("acc2", [quota(21)], { poolStatus: "ready" }),
+      account("acc3", [quota(100)], { poolStatus: "ready" }),
+    ]);
+    expect(availabilityOf(row)).toBe("available");
+  });
+
+  it("is exhausted only when every account is out", () => {
+    const row = pooled([
+      account("acc1", [quota(100)], { poolStatus: "ready" }),
+      account("acc2", [quota(100)], { poolStatus: "ready" }),
+    ]);
+    expect(availabilityOf(row)).toBe("exhausted");
+  });
+
+  it("reports unknown when no account could be judged", () => {
+    // A fetch failure is not evidence of exhaustion.
+    const row = pooled([
+      { accountId: "a", accountLabel: "a", usage: usage("commandcode", [], "error") },
+      { accountId: "b", accountLabel: "b", usage: usage("commandcode", [], "unconfigured") },
+    ]);
+    expect(availabilityOf(row)).toBe("unknown");
+  });
+
+  it("treats a disabled account as unusable and thus evidence of exhaustion", () => {
+    const row = pooled([account("acc1", [quota(100)], { poolStatus: "disabled" })]);
+    expect(availabilityOf(row)).toBe("exhausted");
+  });
+});
+
+describe("accountUsable", () => {
+  it("is false for a cooled-down account even with quota to spare", () => {
+    // Multiprovider's local cooldown is independent of quota, and this is
+    // exactly the case the operator needs to see: a full bar that is not being
+    // used because the scheduler parked the account.
+    const cooled = account("acc1", [quota(0)], { poolStatus: "cooldown", cooldownMs: 600_000 });
+    expect(availabilityOf(cooled.usage)).toBe("available");
+    expect(accountUsable(cooled)).toBe(false);
+  });
+
+  it("is false for a disabled account", () => {
+    expect(accountUsable(account("acc1", [quota(0)], { poolStatus: "disabled" }))).toBe(false);
+  });
+
+  it("is true for a ready account with room", () => {
+    expect(accountUsable(account("acc1", [quota(10)], { poolStatus: "ready" }))).toBe(true);
+  });
+});
+
+describe("pooled soonest usable reset", () => {
+  const now = 1_700_000_000_000;
+  /** A quota window that resets `afterMs` from the fixed `now`. */
+  const quotaAt = (afterMs: number): QuotaWindow => quota(100, now + afterMs);
+
+  it("is the first account to recover, not the last", () => {
+    // Accounts are alternatives (OR), so the pool is usable as soon as any one
+    // of them comes back.
+    const row = pooled([
+      account("acc1", [quotaAt(9_000_000)], { poolStatus: "ready" }),
+      account("acc2", [quotaAt(2_000_000)], { poolStatus: "ready" }),
+      account("acc3", [quotaAt(5_000_000)], { poolStatus: "ready" }),
+    ]);
+    expect(soonestUsableReset(row, now)).toBe(now + 2_000_000);
+  });
+
+  it("counts a cooldown end as a recovery time", () => {
+    const row = pooled([
+      account("acc1", [quotaAt(9_000_000)], { poolStatus: "ready" }),
+      account("acc2", [quota(0)], { poolStatus: "cooldown", cooldownMs: 300_000 }),
+    ]);
+    expect(soonestUsableReset(row, now)).toBe(now + 300_000);
+  });
+
+  it("ignores a disabled account that will never recover", () => {
+    const row = pooled([
+      account("acc1", [quota(100)], { poolStatus: "disabled" }),
+      account("acc2", [quotaAt(4_000_000)], { poolStatus: "ready" }),
+    ]);
+    expect(soonestUsableReset(row, now)).toBe(now + 4_000_000);
+  });
+
+  it("returns undefined when no account can ever recover", () => {
+    const row = pooled([account("acc1", [quota(100)], { poolStatus: "disabled" })]);
+    expect(soonestUsableReset(row, now)).toBeUndefined();
   });
 });

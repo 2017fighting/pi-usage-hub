@@ -2,7 +2,7 @@
  * Formatting and parsing helpers shared by every provider adapter.
  */
 
-import type { ProviderKey, QuotaWindow, ProviderUsage, Availability } from "./types.js";
+import type { AccountUsage, ProviderKey, QuotaWindow, ProviderUsage, Availability } from "./types.js";
 import { PROVIDER_ORDER } from "./types.js";
 
 export const DEFAULT_FETCH_TIMEOUT_MS = 12_000;
@@ -119,23 +119,77 @@ export function hasUsableGroup(windows: QuotaWindow[]): boolean {
  * - `unknown`: unconfigured/unsupported/error — cannot judge.
  * - `exhausted`: no group still has room in every one of its windows.
  * - `available`: at least one group has room in all of its windows.
+ *
+ * When the provider is a pool and `accounts` were fetched, the answer is
+ * computed over the accounts: a pooled provider is available when *any* of its
+ * accounts can serve right now. That is the whole point of pooling — account #1
+ * being out of quota does not matter while account #2 has room, and reporting
+ * the provider as exhausted because the serving account ran dry would be wrong.
+ * The pool-health half of "can serve right now" lives in `accountUsable`.
  */
 export function availabilityOf(usage: ProviderUsage): Availability {
+  const accounts = usage.accounts;
+  if (accounts && accounts.length > 0) {
+    if (accounts.some(accountUsable)) return "available";
+    // Nothing is usable. Distinguish "all out of quota" from "we could not
+    // tell": an account we could not judge does not prove exhaustion.
+    const judged = accounts.some(
+      (account) =>
+        account.poolStatus === "disabled" ||
+        (account.cooldownMs !== undefined && account.cooldownMs > 0) ||
+        availabilityOf(account.usage) !== "unknown",
+    );
+    return judged ? "exhausted" : "unknown";
+  }
   if (usage.status !== "ok") return "unknown";
   if (usage.windows.length === 0) return "unknown";
   return hasUsableGroup(usage.windows) ? "available" : "exhausted";
 }
 
 /**
- * The reset that matters for "when can I use this again", i.e. the soonest time
- * at which every gating window of some group is unblocked. An exhausted provider
- * waiting on a weekly cap reports the weekly reset, not an earlier 5h reset that
- * would leave it still blocked.
+ * Whether one pooled account can serve a request right now.
+ *
+ * Two independent things must hold, and conflating them is the mistake this
+ * function exists to prevent:
+ *  - the account's own quota has room (`availabilityOf` on its usage), and
+ *  - multiprovider is not holding it out of rotation: disabled by the operator,
+ *    or in a local cooldown after a failure.
+ *
+ * An account with a full quota bar can still be unusable because multiprovider
+ * cooled it down; an account can be out of quota yet be the pool's only member.
+ */
+export function accountUsable(account: AccountUsage): boolean {
+  if (account.poolStatus === "disabled") return false;
+  if (account.cooldownMs !== undefined && account.cooldownMs > 0) return false;
+  return availabilityOf(account.usage) === "available";
+}
+
+/**
+ * The soonest moment one of a pool's accounts becomes usable again.
+ *
+ * This is an OR across accounts — the pool is usable as soon as *any* account
+ * returns — so it is the minimum, not the maximum, over per-account answers. A
+ * cooling-down account contributes its cooldown end; an out-of-quota account
+ * contributes the reset that unblocks its group.
+ *
+ * Returns undefined when no account will ever become usable on its own (all
+ * disabled, or all blocked by a balance with no reset).
  */
 export function soonestUsableReset(
   usage: ProviderUsage,
   nowMs = Date.now(),
 ): number | undefined {
+  const accounts = usage.accounts;
+  if (accounts && accounts.length > 0) {
+    const recoveries = accounts.map((account) => {
+      if (account.poolStatus === "disabled") return undefined;
+      if (account.cooldownMs !== undefined && account.cooldownMs > 0) return nowMs + account.cooldownMs;
+      return soonestUsableReset(account.usage, nowMs);
+    });
+    const timed = recoveries.filter((value): value is number => value !== undefined);
+    return timed.length > 0 ? Math.min(...timed) : undefined;
+  }
+
   const gating = gatingWindows(usage.windows);
   if (gating.length === 0) return undefined;
 

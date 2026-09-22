@@ -41,6 +41,18 @@ export interface MultiProviderServiceAnnouncement {
     ctx: unknown,
     signal?: AbortSignal,
   ): Promise<{ accessToken: string; label: string; source?: string } | undefined>;
+  /**
+   * Resolve one *named* pool account's credential, not just the active one.
+   * Added to our multiprovider fork so `/usage` can report account-scoped usage
+   * for every account in a pool. Returns undefined for `pi:default` (Pi owns
+   * that credential), and for an unknown provider or account id.
+   */
+  resolveAccountAuth?(
+    providerId: string,
+    accountId: string,
+    ctx: unknown,
+    signal?: AbortSignal,
+  ): Promise<{ accessToken: string; label: string; source?: string } | undefined>;
   onActiveAccountChanged?(
     providerId: string,
     callback: (event: { providerId: string; account?: MultiProviderActiveAccount; ctx: unknown }) => void,
@@ -61,6 +73,23 @@ export interface MultiProviderServiceAnnouncement {
 
 export interface AccountSnapshot {
   accounts: Array<{ id: string; label: string; status: string; cooldownUntil?: number }>;
+}
+
+/**
+ * One account row in a pool snapshot, normalized for our use.
+ *
+ * These ids and labels are the account *identity* only: never a credential.
+ */
+export interface PoolAccount {
+  id: string;
+  label: string;
+  status?: string;
+  cooldownMs?: number;
+}
+
+/** True when a pool account id is the provider's own credential rather than a stored one. */
+export function isUpstreamAccount(accountId: string | undefined): boolean {
+  return accountId === UPSTREAM_ACCOUNT_ID;
 }
 
 /** Minimal surface of the Pi extension context we depend on. */
@@ -150,6 +179,107 @@ export interface ResolveOptions {
   multiproviderContext?: unknown;
   signal?: AbortSignal;
   env?: Record<string, string | undefined>;
+}
+
+/**
+ * Enumerate a pool's accounts from multiprovider, including local cooldowns.
+ *
+ * Returns `undefined` when this provider is not pooled (no snapshot, or the
+ * extension is unpatched/absent), and an empty array when the pool exists but
+ * has no accounts. The distinction matters: `undefined` means "not pooled, use
+ * the normal single-credential path", while `[]` means "pooled but empty".
+ *
+ * Only identity and health are read here — never a credential.
+ */
+export async function listPoolAccounts(
+  multiprovider: MultiProviderServiceAnnouncement | undefined,
+  poolId: string | undefined,
+): Promise<PoolAccount[] | undefined> {
+  if (!multiprovider?.getPoolSnapshot || !poolId) return undefined;
+  let snapshot: AccountSnapshot | undefined;
+  try {
+    snapshot = await multiprovider.getPoolSnapshot(poolId);
+  } catch {
+    return undefined;
+  }
+  if (!snapshot) return undefined;
+  const now = Date.now();
+  return snapshot.accounts.map((account) => ({
+    id: account.id,
+    label: account.label,
+    ...(account.status === undefined ? {} : { status: account.status }),
+    ...(account.cooldownUntil !== undefined && account.cooldownUntil > now
+      ? { cooldownMs: account.cooldownUntil - now }
+      : {}),
+  }));
+}
+
+export interface ResolveAccountOptions {
+  /** Real Pi provider id whose pool this account belongs to. */
+  piProviderId: string;
+  accountId: string;
+  registry: ModelRegistryLike;
+  multiprovider?: MultiProviderServiceAnnouncement;
+  multiproviderContext?: unknown;
+  signal?: AbortSignal;
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Resolve one named pool account's credential.
+ *
+ * The two kinds of pool account resolve through entirely different owners, and
+ * mixing them up would silently mislabel quota:
+ *
+ *  - A **stored** account resolves only through `resolveAccountAuth`. It must
+ *    never fall back to Pi's registry or `auth.json`, because those hold the
+ *    *upstream* credential: doing so would render the upstream account's quota
+ *    under a different account's label. When the pool cannot resolve it, this
+ *    reports `source: "none"` and the caller shows that one account as
+ *    unconfigured, leaving the other accounts honest.
+ *  - The **upstream** account (`pi:default`) has no credential in the pool at
+ *    all, so Pi's registry and `auth.json` are its only sources — and they are
+ *    the right ones, being exactly what Pi itself would send.
+ */
+export async function resolveAccountCredential(options: ResolveAccountOptions): Promise<ResolvedCredential> {
+  const { piProviderId, accountId, registry, multiprovider, multiproviderContext, signal } = options;
+
+  if (!isUpstreamAccount(accountId)) {
+    if (!multiprovider?.resolveAccountAuth) return { source: "none", accountId };
+    try {
+      const auth = await multiprovider.resolveAccountAuth(piProviderId, accountId, multiproviderContext, signal);
+      if (auth?.accessToken) {
+        // For antigravity the token is a JSON credential blob; the provider
+        // adapter knows how to interpret it.
+        return { token: auth.accessToken, accountId, accountLabel: auth.label, source: "multiprovider" };
+      }
+    } catch {
+      // One account failing to resolve must not fail the whole pool.
+    }
+    return { source: "none", accountId };
+  }
+
+  try {
+    const status = registry.getProviderAuthStatus?.(piProviderId);
+    if (!status || status.configured !== false) {
+      const token = await registry.getApiKeyForProvider?.(piProviderId);
+      if (typeof token === "string" && token.trim() !== "") {
+        return { token, accountId, source: "model-registry" };
+      }
+      const auth = await registry.getProviderAuth?.(piProviderId);
+      const fromHeaders = bearerFromHeaders(auth?.auth?.headers);
+      const direct = auth?.auth?.apiKey;
+      const resolved = typeof direct === "string" && direct.trim() !== "" ? direct : fromHeaders;
+      if (resolved) return { token: resolved, accountId, source: "model-registry" };
+    }
+  } catch {
+    // Fall through to the file fallback.
+  }
+
+  const fileToken = await readAuthFileToken([piProviderId], options.env ?? process.env);
+  if (fileToken) return { token: fileToken, accountId, source: "auth-file" };
+
+  return { source: "none", accountId };
 }
 
 /**

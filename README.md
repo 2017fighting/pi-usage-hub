@@ -21,9 +21,9 @@ Built for the provider mix Pi users actually run: Chinese coding plans, subscrip
 No existing plugin covers this set. `@hk_net/pi-usage-bars` and `@latentminds/pi-quotas` support ZAI, Kimi and DeepSeek but have **no CodeBuddy, Command Code or Antigravity** — and neither understands multiprovider account pools.
 
 Two behaviours are specific to this plugin:
-
 1. **The footer follows the real account.** When a provider is pooled by pi-multiprovider, the footer shows usage for the account that is actually serving the session (`commandcode#acc2`), not the default credential. With the patched multiprovider fork, virtual providers resolve too (`dsv4 → kimi-coding`).
-2. **`/usage` answers "what can I use right now?"** available providers first, exhausted ones ordered by **how soon their quota resets**, so the provider that comes back first is at the top. A provider is only available when *every* window that gates it has room, and the reset shown is the one that actually unblocks it.
+2. **`/usage` breaks a pool down per account.** Configure three CommandCode accounts and all three appear, each with its own quota, cooldown and disabled state — not one row showing whichever credential happened to be active.
+3. **`/usage` answers "what can I use right now?"** available providers first, exhausted ones ordered by **how soon their quota resets**, so the provider that comes back first is at the top. A provider is only available when *every* window that gates it has room, and the reset shown is the one that actually unblocks it. For a pool, "available" means *any* account can serve, and the reset is the first account to return.
 
 ## Install
 
@@ -58,23 +58,67 @@ Refreshed every two minutes, on every turn end, on model switches, and immediate
 
 ### `/usage`
 
-An interactive dashboard listing every provider, grouped by availability, with the selected row expanded. Search filters by name. `↑`/`↓`/`PageUp`/`PageDown` navigate, `Esc` closes.
+An interactive dashboard listing every provider, grouped by availability, with the selected row expanded. **Pooled providers list every account as its own sub-row**, each fetched with that account's credential, so a `commandcode` pool of three shows all three quotas. Search filters by provider *or account label*. `↑`/`↓`/`PageUp`/`PageDown` navigate, `Esc` closes.
 
 ```
   AVAILABLE
-  → ● ZAI CN
-      5h █░░░░░░░░░░░░░ 4% ⟳ 14:08 (2h 44m)
-      Weekly ██████████████ 100% ⟳ 9/25 10:27 (3d 23h)
-  → ● CommandCode
-      5h ███░░░░░░░░░░░ 21% ⟳ 15:57 (4h 34m)
-      Monthly credits ██░░░░░░░░░░░░ 12% monthly 8.76 · purchased 0.00
+  → ● CommandCode ×3
+      ● google           ✓
+        Weekly 91% · ⟳3d
+      ● hello@raenzo.com
+        Weekly 100% · ⟳3d
+      ● github            cooling 12m
+        Weekly 100% · ⟳2d 12h
 
   EXHAUSTED (soonest reset first)
   → ● DeepSeek
       Balance -CN¥0.20 · topped-up -CN¥0.20 · granted CN¥0.00
 ```
 
-In non-interactive modes `/usage` prints a plain-text summary instead.
+The provider is `available` because `google` has room, even though the other two
+accounts are out of quota. Selecting it expands every account's full window list:
+
+```
+  → ● CommandCode ×3
+      ● google           ✓
+        5h ███░░░░░░░░░░░ 23% ⟳ 16:08 (4h 30m)
+        Weekly █████████████░ 91% ⟳ 9/25 11:38 (3d)
+        Monthly credits ███████░░░░░░░ 54% monthly 5.40 · purchased 0.00
+      ● hello@raenzo.com
+        5h ███████░░░░░░░ 47% ⟳ 16:38 (5h)
+        Weekly ██████████████ 100% ⟳ 9/25 11:38 (3d)
+      ● github            cooling 12m
+        5h ░░░░░░░░░░░░░░ 0% ⟳ 14:38 (3h)
+        Weekly ██████████████ 100% ⟳ 9/24 23:38 (2d 12h)
+```
+
+Each account gets its own status dot, and the two reasons an account can be
+unusable are shown separately because they are independent:
+
+- **red dot** — out of quota (its own credential's windows are spent)
+- **`cooling 12m`** — multiprovider has the account in a local cooldown, which is
+  invisible in quota: an account at 0% used can still be skipped by the scheduler
+- **`disabled`** — you turned the account off in `/multilogin`
+- **`✓`** — the account that served the session's most recent request
+
+The **provider's** badge summarises the pool: it is `available` when *any* account
+can serve, and `exhausted` only when every account is out. That is the point of
+pooling, and reporting a pool exhausted because the serving account ran dry would
+send you away from a provider with two good accounts left.
+
+Per-account fetching happens only when `/usage` is opened — each account is one
+HTTP call, so the two-minute footer poll deliberately keeps fetching just the
+serving account.
+
+In non-interactive modes `/usage` prints a plain-text summary instead, with one
+indented line per account:
+
+```
+CommandCode [OK] 5h 23%, Weekly 91%, Monthly credits 54%
+  - google [OK] ✓ 5h 23%, Weekly 91%, Monthly credits 54%
+  - hello@raenzo.com [EXHAUSTED] 5h 47%, Weekly 100%, Monthly credits 60%
+  - github [EXHAUSTED, cooling 12m] 5h 0%, Weekly 100%, Monthly credits 60%
+```
 
 ### `--usage`
 
@@ -103,6 +147,23 @@ Credential resolution prefers the account in use:
 3. Pi's `auth.json` (last resort)
 
 Only the token for the account being displayed is resolved; the plugin never reads multiprovider's private credential store directly.
+
+### Every account, not just the serving one
+
+The footer shows the serving account. `/usage` additionally enumerates the whole
+pool through `getPoolSnapshot` and resolves each account through
+`resolveAccountAuth(providerId, accountId, ctx)` — both additive methods on the
+multiprovider service announcement.
+
+The upstream (`pi:default`) account is resolved through Pi rather than the pool,
+because it has no stored credential there. That distinction is enforced in both
+directions: a *stored* account is **never** allowed to fall back to Pi's registry
+or `auth.json`, since those hold the upstream credential and would print the
+upstream account's quota under another account's label.
+
+Against an unpatched multiprovider these methods are absent, and the plugin falls
+back to the previous single-credential behaviour: one row per provider, no account
+breakdown.
 
 For **virtual providers**, the serving backend is resolved through the multiprovider service event. This requires a small patch to pi-multiprovider that routes virtual pools through the service announcement (`getVirtualIntegration`) and exposes pool health via `getPoolSnapshot`. Both are additive and optional: against an unpatched multiprovider the plugin falls back to reading `/switch-account` session pins, and simply shows nothing for automatically-rotating virtuals.
 
@@ -161,12 +222,23 @@ A provider is **available** only when some group of windows is entirely unblocke
 - **CodeBuddy** — the combined total gates usage; individual packages are informational alternatives (OR).
 - **Kimi** — the 5h window and the monthly pool both gate (AND), so the provider needs room in both.
 
-The **reset shown for an exhausted provider is the one that actually unblocks it** — a provider waiting on a weekly cap reports the weekly reset, never an earlier 5h reset that would leave it still blocked. Exhausted prepaid balances with no reset time sort last, under `no reset`.
+When a provider is **pooled** by multiprovider, grouping happens at two levels. Within an account the rules above apply; across accounts they are ORed at the provider, because any one account can serve a request:
+
+```
+provider available  =  ANY account usable
+account usable      =  its quota has room  AND  it is not cooling down  AND  it is not disabled
+```
+
+Quota and pool health are deliberately kept apart, since they fail independently: an account at 0% used can still be skipped because multiprovider cooled it down after a failure, and an account can be out of quota while still being the pool's only member. `/usage` shows both, side by side.
+
+The **reset shown for an exhausted provider is the one that actually unblocks it** — a provider waiting on a weekly cap reports the weekly reset, never an earlier 5h reset that would leave it still blocked. Exhausted prepaid balances with no reset time sort last, under `no reset`. For a pooled provider that reset is the **first** account to recover (the minimum, because accounts are alternatives) rather than the last.
+
+Per-provider notes:
 
 - **CodeBuddy** sells credit packages. Each package carries its own cycle end time. Authentication uses the CodeBuddy OAuth JWT Pi already stores — no browser cookie is needed.
 - **DeepSeek** is a prepaid balance with no reset. It reports as `exhausted` when the balance reaches zero (a negative balance is valid and shown as such).
 - **Antigravity** prefers the grouped `retrieveUserQuotaSummary` (Gemini and Claude/GPT pools, each with 5h + weekly buckets). When that is gated, it falls back to per-model `quotaInfo`, which is **pool-shared**, not a private per-model budget.
-- Fetch failures are reported as `unknown`, never as zero.
+- Fetch failures are reported as `unknown`, never as zero. One account failing to fetch leaves the other accounts in the pool reported normally.
 
 ## Development
 

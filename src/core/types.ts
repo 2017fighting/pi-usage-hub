@@ -105,6 +105,45 @@ export interface QuotaWindow {
 /** Freshness/error state of a single provider fetch. */
 export type FetchStatus = "ok" | "unconfigured" | "unsupported" | "error";
 
+/**
+ * Local multiprovider scheduling state for one pooled account. This is not
+ * quota: an account can have plenty of quota left and still be unusable because
+ * multiprovider cooled it down after a failure.
+ */
+export type AccountPoolStatus = "ready" | "cooldown" | "disabled";
+
+/**
+ * One account's own usage.
+ *
+ * A pooled provider (multiprovider) has one credential per account and therefore
+ * one independent quota/balance per account. The provider-level `ProviderUsage`
+ * cannot express that: it fetches a single credential. `/usage` fetches each
+ * account separately and renders them as sub-rows.
+ */
+export interface AccountUsage {
+  /** Multiprovider account id. `pi:default` is the provider's own credential. */
+  accountId: string;
+  /** Operator-set label from /multilogin, e.g. "google". */
+  accountLabel: string;
+  /**
+   * The account's own usage, already fetched with that account's credential.
+   * `accountId`/`accountLabel` are carried on the parent, not repeated here.
+   */
+  usage: ProviderUsage;
+  /** Local multiprovider scheduling state, when a pool snapshot was available. */
+  poolStatus?: AccountPoolStatus;
+  /** Remaining local cooldown in ms from now, when the account is cooling down. */
+  cooldownMs?: number;
+  /** True when this is the account that served the session's most recent request. */
+  inUse?: boolean;
+  /**
+   * True when the pool is the multiprovider upstream credential (`pi:default`),
+   * so its numbers come from the same credential Pi itself uses. Resolving its
+   * token is delegated to Pi rather than to multiprovider.
+   */
+  isUpstream?: boolean;
+}
+
 export interface ProviderUsage {
   provider: ProviderKey;
   /** Account label when the provider is a multiprovider pool with multiple accounts. */
@@ -122,6 +161,20 @@ export interface ProviderUsage {
   stale?: boolean;
   /** Local multiprovider cooldown in ms from now, when the account is cooling down. */
   cooldownMs?: number;
+  /**
+   * Per-account usage, present only when the provider is a multiprovider pool
+   * and the caller fetched every account (the `/usage` dashboard). Absent for
+   * the footer's single-account poll, which keeps one request per interval.
+   *
+   * When present, `windows`/`status`/`accountLabel` describe the *serving*
+   * account so the footer path keeps working unchanged.
+   */
+  accounts?: AccountUsage[];
+  /**
+   * True when the provider is pooled by multiprovider, even if `accounts` is
+   * absent because only the serving account was polled.
+   */
+  pooled?: boolean;
 }
 
 /** Overall availability of a provider, used for sorting in /usage. */
