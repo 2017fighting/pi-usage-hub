@@ -103,6 +103,28 @@ describe("resolveCredential", () => {
     expect(credential.source).toBe("none");
     expect(credential.token).toBeUndefined();
   });
+
+  it("falls back to a provider env var only after the stored credential", async () => {
+    // CLINE_API_KEY is how the ClinePass provider is often set up, so a hub
+    // installed without that extension must still find the account.
+    const credential = await resolveCredential({
+      piProviderIds: ["clinepass"],
+      registry: { getApiKeyForProvider: vi.fn().mockResolvedValue(undefined) },
+      env: { PI_CODING_AGENT_DIR: "/nonexistent-dir-for-test", CLINE_API_KEY: " sk_env_key " },
+      envTokenKeys: ["CLINE_API_KEY"],
+    });
+    expect(credential).toMatchObject({ token: "sk_env_key", source: "env" });
+  });
+
+  it("does not invent an env credential when the variable is empty", async () => {
+    const credential = await resolveCredential({
+      piProviderIds: ["clinepass"],
+      registry: { getApiKeyForProvider: vi.fn().mockResolvedValue(undefined) },
+      env: { PI_CODING_AGENT_DIR: "/nonexistent-dir-for-test", CLINE_API_KEY: "   " },
+      envTokenKeys: ["CLINE_API_KEY"],
+    });
+    expect(credential).toEqual({ source: "none" });
+  });
 });
 
 describe("isUpstreamAccount", () => {
@@ -207,6 +229,22 @@ describe("resolveAccountCredential", () => {
     });
     expect(credential).toMatchObject({ token: "pi-token", source: "model-registry" });
     expect(multiprovider.resolveAccountAuth).not.toHaveBeenCalled();
+  });
+
+  it("resolves an env-configured upstream account the same way the footer does", async () => {
+    // The single-credential path accepts envTokenKeys; the pool path must too,
+    // or a provider configured purely through an env var would report its
+    // upstream pool account as unconfigured while the footer showed it fine.
+    const credential = await resolveAccountCredential({
+      piProviderId: "clinepass",
+      accountId: UPSTREAM_ACCOUNT_ID,
+      registry: { getApiKeyForProvider: vi.fn().mockResolvedValue(undefined) },
+      multiprovider: {},
+      multiproviderContext: {},
+      env: { PI_CODING_AGENT_DIR: "/nonexistent-dir-for-test", CLINE_API_KEY: "sk_pool_env" },
+      envTokenKeys: ["CLINE_API_KEY"],
+    });
+    expect(credential).toMatchObject({ token: "sk_pool_env", accountId: UPSTREAM_ACCOUNT_ID, source: "env" });
   });
 
   it("never resolves a stored account through Pi's own credential", async () => {

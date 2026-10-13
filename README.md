@@ -15,6 +15,7 @@ Built for the provider mix Pi users actually run: Chinese coding plans, subscrip
 | Kimi For Coding | `kimi-coding` | 5h window + monthly subscription pool |
 | Google Antigravity | `antigravity` | Gemini and Claude/GPT pools (5h + weekly) |
 | OpenCode Go | `opencode-go` | rolling 5h, weekly, monthly percentages |
+| ClinePass | `clinepass`, `cline-pass` | 5h + weekly + monthly plan caps |
 
 ## Why another usage plugin
 
@@ -53,6 +54,8 @@ Colours shift green → amber (≥70%) → red (≥90%). Pooled accounts are lab
 ```
 commandcode#acc2 ██░░░░ 21% ⟳4h cooldown 12m
 ```
+
+A provider this plugin does not serve renders nothing at all — the footer is for quota, not for announcing what cannot be tracked. Unresolvable *virtual* backends are the exception and still say why, since that is a pool the user configured.
 
 Refreshed every two minutes, on every turn end, on model switches, and immediately when multiprovider changes the active account.
 
@@ -184,6 +187,11 @@ Several of these are reverse-engineered subscription surfaces, so endpoints drif
 | `PI_KIMI_USAGE_ENDPOINT` | `https://api.kimi.com/coding/v1/usages` |
 | `PI_ANTIGRAVITY_ENDPOINT` | `https://daily-cloudcode-pa.googleapis.com` |
 | `PI_OPENCODE_GO_USAGE_ENDPOINT` | `https://opencode.ai/zen/go/v1/usage` |
+| `PI_CLINEPASS_USAGE_ENDPOINT` | `https://api.cline.bot/api/v1/users/me/plan/usage-limits` |
+
+ClinePass also follows `CLINE_API_BASE` — the base override both ClinePass Pi
+packages use for chat traffic — so pointing chat at a proxy moves the usage
+endpoint with it. `PI_CLINEPASS_USAGE_ENDPOINT` wins over the derived URL.
 
 ## Events for other extensions
 
@@ -221,6 +229,7 @@ A provider is **available** only when some group of windows is entirely unblocke
 - **Antigravity** — Gemini and Claude/GPT are independent pools (OR); within a pool the 5h and weekly buckets both apply (AND).
 - **CodeBuddy** — the combined total gates usage; individual packages are informational alternatives (OR).
 - **Kimi** — the 5h window and the monthly pool both gate (AND), so the provider needs room in both.
+- **ClinePass** — its three caps nest (5h ⊂ weekly ⊂ monthly), so all three gate (AND): a request has to fit in every one. Only `/api/v1/users/me/plan/usage-limits` is read, so the row is percentages; the plan name, its expiry and the dollar cap thresholds live behind a second endpoint this plugin does not fetch. Window types the API adds later are ignored rather than guessed at.
 
 When a provider is **pooled** by multiprovider, grouping happens at two levels. Within an account the rules above apply; across accounts they are ORed at the provider, because any one account can serve a request:
 
@@ -238,6 +247,7 @@ Per-provider notes:
 - **CodeBuddy** sells credit packages. Each package carries its own cycle end time. Authentication uses the CodeBuddy OAuth JWT Pi already stores — no browser cookie is needed.
 - **DeepSeek** is a prepaid balance with no reset. It reports as `exhausted` when the balance reaches zero (a negative balance is valid and shown as such).
 - **Antigravity** prefers the grouped `retrieveUserQuotaSummary` (Gemini and Claude/GPT pools, each with 5h + weekly buckets). When that is gated, it falls back to per-model `quotaInfo`, which is **pool-shared**, not a private per-model budget.
+- **ClinePass** reuses the credential Pi already stores for the `clinepass` provider, so no separate login is needed: a static API key (`sk_…`) or a WorkOS token (`workos:…`) both work, and neither is refreshed here — the provider's own extension owns that. With no stored credential it falls back to `CLINE_API_KEY`, so a hub running without the ClinePass provider extension still reports the account.
 - Fetch failures are reported as `unknown`, never as zero. One account failing to fetch leaves the other accounts in the pool reported normally.
 
 ## Development

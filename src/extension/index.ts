@@ -2,7 +2,7 @@
  * pi-usage-hub — unified quota/usage status bar and /usage dashboard.
  *
  * Supported providers: zai-coding-cn, codebuddy (+intl), commandcode,
- * deepseek, kimi-coding, antigravity, opencode-go.
+ * deepseek, kimi-coding, antigravity, opencode-go, clinepass.
  *
  * The footer shows usage for the provider actually serving the session,
  * resolved through pi-multiprovider when that provider is pooled or virtual.
@@ -69,6 +69,12 @@ interface UsageState {
 
 /** Why the footer has nothing to show, surfaced so the reason is discoverable. */
 let lastNoneReason: string | undefined = undefined;
+/**
+ * True when that reason is not worth rendering in the footer (the active
+ * provider is simply one we do not serve). Kept apart from `lastNoneReason` so
+ * diagnostics still carry the reason while the footer stays quiet.
+ */
+let lastNoneSilent = false;
 /** A virtual provider whose backends are known but none is selected yet. */
 let pendingVirtual: { virtualProviderId: string; backendLabels: string[] } | undefined;
 
@@ -126,16 +132,19 @@ export default function usageHub(pi: ExtensionAPI): void {
     if (resolution.kind === "provider") {
       const { kind: _kind, ...target } = resolution;
       lastNoneReason = undefined;
+      lastNoneSilent = false;
       return target;
     }
     if (resolution.kind === "pending") {
       // Backends known, none selected yet (before the session's first request).
       pendingVirtual = resolution;
       lastNoneReason = undefined;
+      lastNoneSilent = false;
       return undefined;
     }
     pendingVirtual = undefined;
     lastNoneReason = resolution.reason;
+    lastNoneSilent = resolution.silent === true;
     return undefined;
   }
 
@@ -155,6 +164,7 @@ export default function usageHub(pi: ExtensionAPI): void {
       multiproviderContext: ctx,
       signal,
       env: process.env,
+      envTokenKeys: descriptor.envTokenKeys,
     });
     if (!credential.token) {
       return {
@@ -210,12 +220,14 @@ export default function usageHub(pi: ExtensionAPI): void {
       }
       // Explain the absence instead of silently rendering nothing: a virtual
       // provider whose backend cannot be resolved used to leave the footer empty
-      // with no clue why.
+      // with no clue why. A provider we simply do not serve is the exception —
+      // that reason is noise on every turn, so it renders nothing (`silent`);
+      // it stays in the `pi-usage-hub:update` event and the `--usage` JSON.
       const reason = lastNoneReason;
       const model = ctx.model?.provider;
       ctx.ui.setStatus(
         STATUS_KEY,
-        reason && model ? theme.fg("dim", `${model}: ${reason}`) : undefined,
+        reason && model && !lastNoneSilent ? theme.fg("dim", `${model}: ${reason}`) : undefined,
       );
       return;
     }
@@ -367,6 +379,7 @@ export default function usageHub(pi: ExtensionAPI): void {
       multiproviderContext: ctx,
       signal,
       env: process.env,
+      envTokenKeys: descriptor.envTokenKeys,
     });
     if (!credential.token) {
       return { provider: descriptor.key, status: "unconfigured", windows: [], fetchedAt: Date.now() };
@@ -444,6 +457,7 @@ export default function usageHub(pi: ExtensionAPI): void {
       multiproviderContext: ctx,
       signal,
       env: process.env,
+      envTokenKeys: descriptor.envTokenKeys,
     });
     if (!credential.token) {
       return {

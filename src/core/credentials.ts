@@ -110,7 +110,7 @@ export interface ResolvedCredential {
   accountLabel?: string;
   /** Local multiprovider cooldown for this account, in ms from now. */
   cooldownMs?: number;
-  source: "multiprovider" | "model-registry" | "auth-file" | "none";
+  source: "multiprovider" | "model-registry" | "auth-file" | "env" | "none";
 }
 
 /** Authorization header value may hold a bearer token when apiKey is absent. */
@@ -179,6 +179,13 @@ export interface ResolveOptions {
   multiproviderContext?: unknown;
   signal?: AbortSignal;
   env?: Record<string, string | undefined>;
+  /**
+   * Provider-specific env vars holding a bearer token, tried in order after
+   * `auth.json`. Kept last because they are the least specific source: an
+   * operator who exported a key and also ran `/login` means the stored
+   * credential is the account actually serving the session.
+   */
+  envTokenKeys?: string[];
 }
 
 /**
@@ -223,6 +230,14 @@ export interface ResolveAccountOptions {
   multiproviderContext?: unknown;
   signal?: AbortSignal;
   env?: Record<string, string | undefined>;
+  /**
+   * Provider-specific env vars holding a bearer token, tried after `auth.json`
+   * for the upstream (`pi:default`) account. The pool's *stored* accounts never
+   * consult the environment: their credential belongs to multiprovider, and
+   * resolving one from the ambient environment would label another account's
+   * quota with this account's name.
+   */
+  envTokenKeys?: string[];
 }
 
 /**
@@ -279,6 +294,15 @@ export async function resolveAccountCredential(options: ResolveAccountOptions): 
   const fileToken = await readAuthFileToken([piProviderId], options.env ?? process.env);
   if (fileToken) return { token: fileToken, accountId, source: "auth-file" };
 
+  // Same env fallback as the single-credential path: the upstream account is
+  // resolved from ambient configuration, so a provider set up purely through an
+  // env var must work here too.
+  const env = options.env ?? process.env;
+  for (const key of options.envTokenKeys ?? []) {
+    const value = env[key]?.trim();
+    if (value) return { token: value, accountId, source: "env" };
+  }
+
   return { source: "none", accountId };
 }
 
@@ -325,6 +349,14 @@ export async function resolveCredential(options: ResolveOptions): Promise<Resolv
   // 3. auth.json fallback (covers providers whose extension stores creds directly).
   const fileToken = await readAuthFileToken(piProviderIds, options.env ?? process.env);
   if (fileToken) return { token: fileToken, source: "auth-file" };
+
+  // 4. Provider env vars (e.g. CLINE_API_KEY), for installs that configure the
+  //    provider's own extension through the environment and never log in.
+  const env = options.env ?? process.env;
+  for (const key of options.envTokenKeys ?? []) {
+    const value = env[key]?.trim();
+    if (value) return { token: value, source: "env" };
+  }
 
   return { source: "none" };
 }

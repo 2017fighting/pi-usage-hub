@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import { parseZaiCodingCn } from "../src/providers/zai-coding-cn.js";
 import { parseKimiCoding } from "../src/providers/kimi-coding.js";
 import { parseDeepSeekBalance } from "../src/providers/deepseek.js";
@@ -6,6 +6,8 @@ import { parseCommandCodeCredits, applyCommandCodePeriod, applyCommandCodeUsage 
 import { parseCodeBuddySummary, applyCodeBuddyPackageDetails, codeBuddyWindows } from "../src/providers/codebuddy.js";
 import { parseAntigravityQuotaSummary, parseAntigravityAvailableModels, parseAntigravityCredential } from "../src/providers/antigravity.js";
 import { parseOpenCodeGoUsage } from "../src/providers/opencode-go.js";
+import { parseClinePassLimits, fetchClinePassUsage } from "../src/providers/clinepass.js";
+import { resolveEndpoints } from "../src/core/endpoints.js";
 
 describe("zai-coding-cn parser", () => {
   it("maps tokens limits to window labels using unit multipliers", () => {
@@ -261,5 +263,125 @@ describe("opencode-go parser", () => {
 
   it("returns nothing for an unexpected shape", () => {
     expect(parseOpenCodeGoUsage({})).toEqual([]);
+  });
+});
+
+describe("clinepass parser", () => {
+  it("maps the live usage-limits payload onto the three nested caps", () => {
+    // Captured verbatim from GET /api/v1/users/me/plan/usage-limits: the three
+    // billing caps, each with a 0-100 percentage and an ISO reset that carries
+    // more fractional digits than Date.parse's spec format allows.
+    const payload = {
+      success: true,
+      data: {
+        limits: [
+          { type: "five_hour", percentUsed: 0, resetsAt: "2026-10-13T08:15:48.8187185Z" },
+          { type: "weekly", percentUsed: 12.5, resetsAt: "2026-10-20T03:15:48.82088406Z" },
+          { type: "monthly", percentUsed: 100, resetsAt: "2026-11-12T03:15:48.82291223Z" },
+        ],
+      },
+    };
+    const windows = parseClinePassLimits(payload);
+    expect(windows.map((w) => [w.label, w.usedPercent, w.windowSeconds, w.limited, w.gating])).toEqual([
+      ["5h", 0, 5 * 3600, false, undefined],
+      ["Weekly", 13, 7 * 86_400, false, undefined],
+      ["Monthly", 100, 30 * 86_400, true, undefined],
+    ]);
+    // Resets are kept: an exhausted cap must be able to report when it frees up.
+    expect(windows.every((w) => typeof w.resetsAt === "number")).toBe(true);
+    expect(windows[0]!.resetsAt).toBe(Date.parse("2026-10-13T08:15:48.818Z"));
+    expect(windows.every((w) => w.kind === "quota")).toBe(true);
+  });
+
+  it("ignores window types it does not know", () => {
+    // Only the documented caps are rendered. Guessing at a future window would
+    // either hide a real cap or invent one that gates the provider.
+    const payload = {
+      data: {
+        limits: [
+          { type: "daily", percentUsed: 100, resetsAt: "2026-10-14T00:00:00Z" },
+          { type: "five_hour", percentUsed: 3 },
+        ],
+      },
+    };
+    expect(parseClinePassLimits(payload).map((w) => w.label)).toEqual(["5h"]);
+  });
+
+  it("skips entries it cannot draw instead of inventing numbers", () => {
+    const payload = {
+      data: {
+        limits: [
+          { type: "weekly" },
+          { type: "monthly", percentUsed: "nope" },
+          { percentUsed: 50 },
+          null,
+          { type: "five_hour", percentUsed: 3 },
+        ],
+      },
+    };
+    const windows = parseClinePassLimits(payload);
+    expect(windows.map((w) => w.label)).toEqual(["5h"]);
+  });
+
+  it("returns nothing for an unexpected shape", () => {
+    expect(parseClinePassLimits({})).toEqual([]);
+    expect(parseClinePassLimits({ data: { limits: "nope" } })).toEqual([]);
+    expect(parseClinePassLimits({ success: false, data: {} })).toEqual([]);
+  });
+});
+
+describe("clinepass fetch", () => {
+  const endpoints = resolveEndpoints({});
+  const liveBody = {
+    success: true,
+    data: { limits: [{ type: "five_hour", percentUsed: 7, resetsAt: "2026-10-13T08:15:48.8187185Z" }] },
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubFetch(body: unknown, init: { status?: number } = {}) {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(body), { status: init.status ?? 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("sends the bearer token and merges injected auth headers", async () => {
+    // multiprovider injects auth through FetchConfig.headers; dropping them
+    // would silently make the request unauthenticated.
+    const fetchMock = stubFetch(liveBody);
+    const usage = await fetchClinePassUsage("sk_test", { headers: { "X-Injected": "1" } }, endpoints);
+    expect(usage.status).toBe("ok");
+    expect(usage.windows.map((w) => w.label)).toEqual(["5h"]);
+    const headers = (fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer sk_test");
+    expect(headers["X-Injected"]).toBe("1");
+  });
+
+  it("fails the call when the body reports success: false", async () => {
+    // A rejected request must never render as real quota, even if it carries
+    // a limits array alongside the failure.
+    stubFetch({ success: false, error: "subscription required", data: liveBody.data });
+    const usage = await fetchClinePassUsage("sk_test", {}, endpoints);
+    expect(usage.status).toBe("error");
+    expect(usage.windows).toEqual([]);
+    expect(usage.error).toBe("subscription required");
+  });
+
+  it("tolerates a response with no success flag", async () => {
+    stubFetch({ data: liveBody.data });
+    expect((await fetchClinePassUsage("sk_test", {}, endpoints)).status).toBe("ok");
+  });
+
+  it("turns 401 and 403 into reasons the user can act on", async () => {
+    stubFetch({}, { status: 401 });
+    expect((await fetchClinePassUsage("sk_test", {}, endpoints)).error).toContain("401");
+    stubFetch({}, { status: 403 });
+    const forbidden = await fetchClinePassUsage("sk_test", {}, endpoints);
+    expect(forbidden.status).toBe("error");
+    expect(forbidden.error).toContain("subscription required");
   });
 });

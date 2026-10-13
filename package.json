@@ -1,7 +1,7 @@
 {
   "name": "pi-usage-hub",
   "version": "0.1.0",
-  "description": "Unified quota/usage status bar and /usage dashboard for Pi (zai-coding-cn, codebuddy, commandcode, deepseek, kimi-coding, antigravity, opencode-go) with multiprovider awareness",
+  "description": "Unified quota/usage status bar and /usage dashboard for Pi (zai-coding-cn, codebuddy, commandcode, deepseek, kimi-coding, antigravity, opencode-go, clinepass) with multiprovider awareness",
   "type": "module",
   "license": "MIT",
   "keywords": [

@@ -13,6 +13,7 @@ import { fetchDeepSeekUsage } from "./deepseek.js";
 import { fetchKimiCodingUsage } from "./kimi-coding.js";
 import { fetchAntigravityUsage } from "./antigravity.js";
 import { fetchOpenCodeGoUsage } from "./opencode-go.js";
+import { fetchClinePassUsage } from "./clinepass.js";
 
 export interface ProviderFetchContext {
   /** The Pi provider id the active model belongs to (e.g. "codebuddy-intl"). */
@@ -33,6 +34,14 @@ export interface ProviderDescriptor {
   ) => Promise<ProviderUsage>;
   /** How the credential is used, for error messages and documentation. */
   authKind: "bearer" | "google-oauth-json";
+  /**
+   * Environment variables that hold a usable bearer token for this provider,
+   * consulted only after Pi's registry and `auth.json` came up empty. Some
+   * providers' own extensions document an env-var setup as their primary path,
+   * so a hub running without that extension would otherwise report them as
+   * unconfigured.
+   */
+  envTokenKeys?: string[];
 }
 
 export const PROVIDERS: ProviderDescriptor[] = [
@@ -85,6 +94,16 @@ export const PROVIDERS: ProviderDescriptor[] = [
     piProviderIds: ["opencode-go"],
     fetch: fetchOpenCodeGoUsage,
     authKind: "bearer",
+  },
+  {
+    key: "clinepass",
+    label: "ClinePass",
+    // `clinepass` is the id both ClinePass pi packages register; `cline-pass`
+    // is the alias the older one accepts.
+    piProviderIds: ["clinepass", "cline-pass"],
+    fetch: fetchClinePassUsage,
+    authKind: "bearer",
+    envTokenKeys: ["CLINE_API_KEY"],
   },
 ];
 

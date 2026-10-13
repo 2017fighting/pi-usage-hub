@@ -17,7 +17,8 @@ export type ProviderKey =
   | "deepseek"
   | "kimi-coding"
   | "antigravity"
-  | "opencode-go";
+  | "opencode-go"
+  | "clinepass";
 
 /** Pi provider ids that map onto our provider keys (some providers register several ids). */
 export const PI_PROVIDER_IDS: Record<string, ProviderKey> = {
@@ -30,6 +31,8 @@ export const PI_PROVIDER_IDS: Record<string, ProviderKey> = {
   "kimi-coding": "kimi-coding",
   antigravity: "antigravity",
   "opencode-go": "opencode-go",
+  clinepass: "clinepass",
+  "cline-pass": "clinepass", // alias used by the other ClinePass pi package
 };
 
 /** Registry order — used as the primary sort key for "available" providers. */
@@ -41,6 +44,7 @@ export const PROVIDER_ORDER: ProviderKey[] = [
   "kimi-coding",
   "antigravity",
   "opencode-go",
+  "clinepass",
 ];
 
 export const PROVIDER_LABELS: Record<ProviderKey, string> = {
@@ -51,6 +55,7 @@ export const PROVIDER_LABELS: Record<ProviderKey, string> = {
   "kimi-coding": "Kimi Code",
   antigravity: "Antigravity",
   "opencode-go": "OpenCode Go",
+  clinepass: "ClinePass",
 };
 
 export type WindowKind = "quota" | "balance";

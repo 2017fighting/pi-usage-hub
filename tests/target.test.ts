@@ -28,6 +28,15 @@ describe("resolveTarget — real providers", () => {
     expect(result).toMatchObject({ kind: "provider", provider: "zai-coding-cn", piProviderId: "zai-coding-cn" });
   });
 
+  it("recognizes both ClinePass provider ids", async () => {
+    // pi-clinepass-provider registers `clinepass`; the other ClinePass package
+    // also accepts `cline-pass`.
+    for (const id of ["clinepass", "cline-pass"]) {
+      const result = await resolveTarget({ model: { provider: id, id: "clinepass/glm-5.3" } });
+      expect(result).toMatchObject({ kind: "provider", provider: "clinepass", piProviderId: id });
+    }
+  });
+
   it("treats a supported provider as real even with no registered providers", async () => {
     // `--no-extensions` runs report no registered ids; a known id must still win.
     const result = await resolveTarget({ model: { provider: "deepseek", id: "deepseek-v4-pro" } });
@@ -37,7 +46,12 @@ describe("resolveTarget — real providers", () => {
   it("reports why an unknown provider shows nothing", async () => {
     const result = await resolveTarget({ model: { provider: "mystery", id: "x" } });
     expect(result.kind).toBe("none");
-    if (result.kind === "none") expect(result.reason).toContain("mystery");
+    if (result.kind === "none") {
+      expect(result.reason).toContain("mystery");
+      // Silent: the footer renders nothing for a provider we do not serve. The
+      // reason is still reported for diagnostics (the update event, --usage JSON).
+      expect(result.silent).toBe(true);
+    }
   });
 
   it("reports no model as none", async () => {
@@ -104,7 +118,10 @@ describe("resolveTarget — multiprovider virtual providers", () => {
     };
     const result = await resolveTarget({ model: VIRTUAL_MODEL, multiprovider, multiproviderContext: {} });
     expect(result.kind).toBe("none");
-    if (result.kind === "none") expect(result.reason).toContain("not a supported provider");
+    if (result.kind === "none") {
+      expect(result.reason).toContain("not a supported provider");
+      expect(result.silent).toBe(true);
+    }
   });
 
   it("reports the pool before any backend has been selected", async () => {

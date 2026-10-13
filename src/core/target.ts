@@ -46,7 +46,14 @@ export type TargetResolution =
    * members is more useful than showing nothing.
    */
   | { kind: "pending"; virtualProviderId: string; backendLabels: string[] }
-  | { kind: "none"; reason: string };
+  /**
+   * No target. `silent` marks a reason that is not worth putting in the footer:
+   * the active provider is simply one this plugin does not serve, which the
+   * user cannot act on and does not need told on every turn. Diagnostic
+   * consumers (the `pi-usage-hub:update` event, `--usage` JSON) still get the
+   * reason either way.
+   */
+  | { kind: "none"; reason: string; silent?: boolean };
 
 export interface TargetResolutionInput {
   model: { provider?: string; id?: string } | undefined;
@@ -100,6 +107,7 @@ export async function resolveTarget(input: TargetResolutionInput): Promise<Targe
     return {
       kind: "none",
       reason: `virtual backend "${fromService.providerId}" is not a supported provider`,
+      silent: true,
     };
   }
 
@@ -117,6 +125,7 @@ export async function resolveTarget(input: TargetResolutionInput): Promise<Targe
     return {
       kind: "none",
       reason: `pinned backend "${pinned.providerId}" is not a supported provider`,
+      silent: true,
     };
   }
 
@@ -143,6 +152,7 @@ export async function resolveTarget(input: TargetResolutionInput): Promise<Targe
   return {
     kind: "none",
     reason: `"${rawProviderId}" is not a supported provider`,
+    silent: true,
   };
 }
 
